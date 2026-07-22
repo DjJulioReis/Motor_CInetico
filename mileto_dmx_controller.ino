@@ -1,52 +1,47 @@
-/**
- * Project: Claudinei DMX/RDM Controller (ESP32-C3) with Mileto App BLE
- *
- * Includes:
- *  - Dual-Photoelectric positioning sensors (Start/End limits)
- *  - NEMA 34 Stepper with non-blocking linear acceleration/deceleration
- *  - TAU-S0837DL Safety solenoid lock with 2.0s idle timeout to prevent chattering
- *  - Standard-compliant DMX/RDM engine with break/idle frame alignment & UID range checks
- *  - SSD1306 Local OLED & debounced rotary encoder UI
- *  - Mileto Bluetooth Low Energy (BLE) control protocol
- */
-
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
+#include <Preferences.h>
+#include "esp_mac.h"
 
-// --- Pins ---
-#define OLED_SDA          5
-#define OLED_SCL          6
-#define SCREEN_WIDTH    128
-#define SCREEN_HEIGHT    64
+// --- INCLUDES SOLICITADOS ---
+#include "driver/uart.h"
+#include "soc/uart_struct.h"
+#include "freertos/queue.h"
+#include "soc/rtc_cntl_reg.h"
+#include <NimBLEDevice.h>
+#include "MILETO_LOGO_1.h"
 
-#define ENCODER_CLK       0
-#define ENCODER_DT        1
-#define ENCODER_SW        2
+#define LARGURA_TELA 128
+#define ALTURA_TELA 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(LARGURA_TELA, ALTURA_TELA, &Wire, OLED_RESET);
 
-#define DMX_RX_PIN        7
-#define DMX_TX_PIN        10
-#define DMX_DE_RE_PIN     3
+// --- PINOUT ATUALIZADO PARA O CONTROLADOR CINETICO ESP32-C3 ---
+#define ENC_CLK 6
+#define ENC_DT   7
+#define ENC_SW  10
+
+#define SENSOR_START_PIN  21
+#define SENSOR_END_PIN    1
 
 #define STEPPER_PUL_PIN   4
 #define STEPPER_DIR_PIN   9
 #define STEPPER_EN_PIN    20
 
-#define SENSOR_START_PIN  21
-#define SENSOR_END_PIN    1
-
 #define SAFETY_LOCK_PIN   2
 
-// --- Stepper Speed Consts ---
+#define DMX_UART_NUM UART_NUM_1
+#define DMX_RX_PIN 20
+#define DMX_TX_PIN 21
+#define RS485_DIR_PIN 3  // Direcao do fluxo RS-485 para RDM
+
+// --- CONSTANTES ---
 #define MAX_SPEED         4000.0
 #define MAX_ACCEL         8000.0
 
-// --- DMX Map ---
+// DMX Channel Offsets
 #define DMX_CH_MODE       1
 #define DMX_CH_POS_MSB    2
 #define DMX_CH_POS_LSB    3
@@ -56,11 +51,15 @@
 #define DMX_CH_EFFECT_ID  7
 #define DMX_CH_LENGTH     7
 
-#define BLE_SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define BLE_CHAR_CTRL_UUID         "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define BLE_CHAR_STATUS_UUID       "c7e462d0-eb14-41d3-a9d0-0870932258aa"
+static QueueHandle_t dmx_queue;
+uint8_t raw_dmx_buf[520];
+int dmx_idx = 0;
+bool dmx_em_frame = false;
 
-// --- Global Variables & States ---
+enum FasesMenu { FASE_MODO, FASE_CAMPO, FASE_VALOR };
+FasesMenu faseAtual = FASE_MODO;
+
+// --- VARIÁVEIS DE ESTADO DO MOTOR ---
 enum HomingState { STATE_IDLE, STATE_HOMING_START, STATE_HOMING_END, STATE_CALIBRATED };
 HomingState homingState = STATE_IDLE;
 
@@ -75,32 +74,12 @@ unsigned long lastStepTime = 0;
 unsigned long stepInterval = 0;
 bool stepState = false;
 
-// Safety Lock Solenoid Parameters
+// Trava Solenoide de Seguranca
 bool isLocked = true;
 unsigned long unlockTime = 0;
 unsigned long lastActiveTime = 0;
 const unsigned long UNLOCK_DELAY_MS = 150;
 const unsigned long IDLE_TIMEOUT_MS = 2000;
-
-// DMX & RDM Parameters
-uint16_t dmxAddress = 1;
-uint8_t dmxBuffer[513];
-bool newPacketReceived = false;
-bool isRdmMuted = false;
-uint8_t uid[6];
-
-// BLE & App Parameters
-bool bleConnected = false;
-BLEServer* pServer = NULL;
-BLECharacteristic* pCtrlCharacteristic = NULL;
-BLECharacteristic* pStatusCharacteristic = NULL;
-
-// Display & UI
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-int encoderClkState = HIGH;
-int menuPosition = 0;
-bool encoderBtnPressed = false;
-unsigned long lastDebounceTime = 0;
 
 // Kinetics Effects
 bool isEffectRunning = false;
@@ -109,174 +88,416 @@ unsigned long effectStartTime = 0;
 int sequenceStep = 0;
 uint8_t groupId = 0;
 
-const int MENU_TOTAL = 5;
-const char* menuOptions[MENU_TOTAL] = {
-    "DMX Address",
-    "Calibrate Limit",
-    "Set Point A",
-    "Set Point B",
-    "Group ID"
-};
-int menuValues[MENU_TOTAL] = {1, 0, 0, 10000, 0};
+// --- VARIÁVEIS DE ESTADO DO SISTEMA ---
+bool sistemaEmModoDMX = false; // Estado Mestre
+int modoAtual = 1;            // Efeito Selecionado (1 a 5)
+int modoDMXTemp = 1;          // Efeito vindo da Mesa DMX
 
-// --- Prototypes ---
-void updateStepper();
-void updateDmx();
-void handleRdmPacket(uint8_t* rdmData, uint16_t length);
-void sendRdmResponse(uint8_t* response, uint16_t length);
-void updateBle();
-void updateEncoder();
-void drawMenu(int currentSelection);
+int linhaSelecionada = 1;
+int enderecoDMX = 1;
+int velocidad = 50;
+int brilhoGeral = 255;
+
+const char* nomesEfeitos[] = { "DMX SYSTEM", "MANUAL", "FADE", "STROBO", "SEQUENC", "FIXO", "XADREZ" };
+
+unsigned long tempoUltimaAtividade = 0;
+bool telaAcesa = true;
+#define TEMPO_SLEEP_TELA 60000
+unsigned long ultimoDebounce = 0;
+
+NimBLEServer* pServer = NULL;
+NimBLECharacteristic* pTxCharacteristic = NULL;
+bool dispositivoConectado = false;
+bool autenticado = false;
+uint32_t desafioHandshake = 0;
+String comandoPendente = "";
+bool novoComandoBle = false;
+
+#define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define TX_UUID                "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+#define RX_UUID                "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+
+Preferences preferences;
+
+// Prototypes
+void lockSolenoid();
+void unlockSolenoid();
+void lockOnIdle();
 void startHoming();
 void stopEffect();
 void startEffect(uint8_t effectId);
 void updateEffects();
-void lockSolenoid();
-void unlockSolenoid();
-void lockOnIdle();
+void updateStepper();
+void setRS485Direction(bool tx);
 
-// BLE Callbacks
-class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) { bleConnected = true; }
-    void onDisconnect(BLEServer* pServer) {
-        bleConnected = false;
-        pServer->startAdvertising();
+class ServerCallbacks: public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
+        dispositivoConectado = true;
+        autenticado = false;
+        randomSeed(micros());
+        desafioHandshake = random(1000, 9999);
+        pServer->updateConnParams(connInfo.getConnHandle(), 16, 32, 0, 400);
+    }
+    void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
+        dispositivoConectado = false;
+        autenticado = false;
+        NimBLEDevice::startAdvertising();
     }
 };
 
-class MyCharCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-        std::string val = pCharacteristic->getValue();
-        if (val.length() > 0) {
-            uint8_t cmd = val[0];
-            switch (cmd) {
-                case 0x01: // Set target pos
-                    if (val.length() >= 5) {
-                        long target = (val[1] << 24) | (val[2] << 16) | (val[3] << 8) | val[4];
-                        targetPos = target;
-                    }
-                    break;
-                case 0x02: startLimit = currentPos; menuValues[2] = currentPos; break;
-                case 0x03: endLimit = currentPos; menuValues[3] = currentPos; homingState = STATE_CALIBRATED; break;
-                case 0x04: startHoming(); break;
-                case 0x05: targetPos = currentPos; stopEffect(); break;
-            }
-        }
+class CharacteristicCallbacks: public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo& connInfo) override {
+      String rxValue = pCharacteristic->getValue();
+      if (rxValue.length() > 0) { comandoPendente = rxValue; novoComandoBle = true; }
     }
 };
 
-void setup() {
-    Serial.begin(115200);
-
-    // Safety Lock
-    pinMode(SAFETY_LOCK_PIN, OUTPUT);
-    lockSolenoid();
-
-    // Stepper
-    pinMode(STEPPER_PUL_PIN, OUTPUT);
-    pinMode(STEPPER_DIR_PIN, OUTPUT);
-    pinMode(STEPPER_EN_PIN, OUTPUT);
-    digitalWrite(STEPPER_EN_PIN, LOW); // Active Low Enable
-
-    // Limit Sensors
-    pinMode(SENSOR_START_PIN, INPUT_PULLUP);
-    pinMode(SENSOR_END_PIN, INPUT_PULLUP);
-
-    // Rotary Encoder
-    pinMode(ENCODER_CLK, INPUT_PULLUP);
-    pinMode(ENCODER_DT, INPUT_PULLUP);
-    pinMode(ENCODER_SW, INPUT_PULLUP);
-    encoderClkState = digitalRead(ENCODER_CLK);
-
-    // RDM UID Generation
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    uid[0] = 0x7F; uid[1] = 0x0A;
-    uid[2] = mac[2]; uid[3] = mac[3]; uid[4] = mac[4]; uid[5] = mac[5];
-
-    // DMX Port
-    pinMode(DMX_DE_RE_PIN, OUTPUT);
-    digitalWrite(DMX_DE_RE_PIN, LOW); // Rx
-    Serial1.begin(250000, SERIAL_8N2, DMX_RX_PIN, DMX_TX_PIN);
-
-    // OLED
-    Wire.begin(OLED_SDA, OLED_SCL);
-    if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-        display.clearDisplay();
-        display.setTextColor(SSD1306_WHITE);
-        display.setTextSize(1);
-        display.setCursor(0, 0);
-        display.println("Mileto DMX - Init OK");
-        display.display();
-    }
-
-    // BLE Service
-    BLEDevice::init("Mileto DMX Controller");
-    pServer = BLEDevice::createServer();
-    pServer->setCallbacks(new MyServerCallbacks());
-    BLEService *pService = pServer->createService(BLE_SERVICE_UUID);
-    pCtrlCharacteristic = pService->createCharacteristic(BLE_CHAR_CTRL_UUID, BLECharacteristic::PROPERTY_WRITE);
-    pCtrlCharacteristic->setCallbacks(new MyCharCallbacks());
-    pStatusCharacteristic = pService->createCharacteristic(BLE_CHAR_STATUS_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-    pStatusCharacteristic->addDescriptor(new BLE2902());
-    pService->start();
-    BLEAdvertising *pAdv = BLEDevice::getAdvertising();
-    pAdv->addServiceUUID(BLE_SERVICE_UUID);
-    pAdv->setScanResponse(true);
-    BLEDevice::startAdvertising();
-
-    menuValues[0] = dmxAddress;
-    menuValues[1] = (homingState == STATE_CALIBRATED) ? 1 : 0;
-    menuValues[2] = startLimit;
-    menuValues[3] = endLimit;
-    menuValues[4] = groupId;
+void acordaTela() {
+  tempoUltimaAtividade = millis();
+  if (!telaAcesa) { display.ssd1306_command(SSD1306_DISPLAYON); telaAcesa = true; }
 }
 
-void loop() {
-    updateStepper();
-    updateDmx();
-    updateBle();
-    updateEffects();
-    updateEncoder();
+void exibirTelaSalvando() {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(20, 25);
+  display.print("SALVANDO...");
+  display.display();
+}
 
-    static int lastPos = -1;
-    int currentMenuPos = menuPosition % MENU_TOTAL;
+void salvarConfiguracao() {
+  preferences.begin("mileto_cfg", false);
+  preferences.putInt("dmx_mode", sistemaEmModoDMX ? 1 : 0);
+  preferences.putInt("modo", modoAtual);
+  preferences.putInt("dmx", enderecoDMX);
+  preferences.putInt("vel", velocidad);
+  preferences.putInt("dim", brilhoGeral);
+  preferences.putLong("start_lim", startLimit);
+  preferences.putLong("end_lim", endLimit);
+  preferences.end();
+}
 
-    if (encoderBtnPressed) {
-        encoderBtnPressed = false;
-        switch (currentMenuPos) {
-            case 0:
-                dmxAddress = dmxAddress + 1;
-                if (dmxAddress > 506) dmxAddress = 1;
-                menuValues[0] = dmxAddress;
-                break;
-            case 1:
-                startHoming();
-                break;
-            case 2:
-                startLimit = currentPos;
-                menuValues[2] = currentPos;
-                break;
-            case 3:
-                endLimit = currentPos;
-                menuValues[3] = currentPos;
-                break;
-            case 4:
-                groupId = (groupId + 1) % 16;
-                menuValues[4] = groupId;
-                break;
+void carregarConfiguracao() {
+  preferences.begin("mileto_cfg", true);
+  sistemaEmModoDMX = (preferences.getInt("dmx_mode", 0) == 1);
+  modoAtual = preferences.getInt("modo", 1);
+  enderecoDMX = preferences.getInt("dmx", 1);
+  velocidad = preferences.getInt("vel", 50);
+  brilhoGeral = preferences.getInt("dim", 255);
+  startLimit = preferences.getLong("start_lim", 0);
+  endLimit = preferences.getLong("end_lim", 10000);
+  preferences.end();
+}
+
+void enviarStatusBT() {
+  static unsigned long last = 0;
+  if (dispositivoConectado && autenticado && millis() - last >= 60) {
+    last = millis();
+    char buf[80];
+    sprintf(buf, "STATS:%d,%d,%ld,%ld,%ld,%ld\n",
+            (homingState == STATE_CALIBRATED) ? 1 : 0,
+            (homingState == STATE_HOMING_START || homingState == STATE_HOMING_END) ? 1 : 0,
+            currentPos, targetPos, startLimit, endLimit);
+    pTxCharacteristic->setValue(buf); pTxCharacteristic->notify();
+  }
+}
+
+void atualizarDisplay() {
+  if (!telaAcesa) return;
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("--- MILETO KINETIC ---");
+
+  display.setCursor(0, 16);
+  if (faseAtual == FASE_MODO) display.print("> "); else display.print("  ");
+
+  if (sistemaEmModoDMX && faseAtual != FASE_MODO) {
+      display.print("MODO: DMX SYSTEM");
+  } else {
+      display.print("MODO: ");
+      display.print(nomesEfeitos[sistemaEmModoDMX ? 0 : modoAtual]);
+  }
+
+  display.drawFastHLine(0, 28, 128, SSD1306_WHITE);
+
+  if (sistemaEmModoDMX) {
+    display.setCursor(0, 36);
+    if (faseAtual == FASE_CAMPO) display.print("> "); else display.print("  ");
+    display.print("Config. Canal");
+    display.setCursor(0, 50);
+    if (faseAtual == FASE_VALOR) display.print("[ "); else display.print("  ");
+    display.print("CANAL DMX: "); display.print(enderecoDMX);
+    if (faseAtual == FASE_VALOR) display.print(" ]");
+  } else {
+     display.setCursor(0, 34);
+     if (faseAtual == FASE_CAMPO && linhaSelecionada == 1) display.print("> "); else display.print("  ");
+     display.print("Pos: "); display.print(currentPos);
+     display.setCursor(0, 48);
+     if (faseAtual == FASE_CAMPO && linhaSelecionada == 2) display.print("> "); else display.print("  ");
+     display.print("Lim: "); display.print(startLimit); display.print("/"); display.print(endLimit);
+  }
+  display.display();
+}
+
+int lastClkState;
+void lidarComEncoder() {
+  int currentClkState = digitalRead(ENC_CLK);
+  if (currentClkState != lastClkState && currentClkState == LOW) {
+    acordaTela();
+    bool subindo = digitalRead(ENC_DT) != currentClkState;
+    if (faseAtual == FASE_MODO) {
+      static int selection = sistemaEmModoDMX ? 0 : modoAtual;
+      if (subindo) selection = (selection + 1) % 7;
+      else selection = (selection <= 0) ? 6 : selection - 1;
+
+      if (selection == 0) { sistemaEmModoDMX = true; }
+      else { sistemaEmModoDMX = false; modoAtual = selection; }
+    }
+    else if (!sistemaEmModoDMX) {
+      if (faseAtual == FASE_CAMPO) {
+        if (subindo) { linhaSelecionada++; if (linhaSelecionada > 2) linhaSelecionada = 1; }
+        else { linhaSelecionada--; if (linhaSelecionada < 1) linhaSelecionada = 2; }
+      }
+      else if (faseAtual == FASE_VALOR) {
+         if (linhaSelecionada == 1) {
+             if (subindo) { targetPos += 100; if (targetPos > endLimit) targetPos = endLimit; }
+             else { targetPos -= 100; if (targetPos < startLimit) targetPos = startLimit; }
+         } else if (linhaSelecionada == 2) {
+             // Manual Homing trigger
+             startHoming();
+         }
+      }
+    } else {
+      if (faseAtual == FASE_VALOR) {
+        if (subindo) { enderecoDMX++; if (enderecoDMX > 512 - DMX_CH_LENGTH + 1) enderecoDMX = 1; }
+        else { enderecoDMX--; if (enderecoDMX < 1) enderecoDMX = 512 - DMX_CH_LENGTH + 1; }
+        if (dispositivoConectado && autenticado) {
+           String syncMsg = "DMX:" + String(enderecoDMX) + "\n";
+           pTxCharacteristic->setValue(syncMsg.c_str()); pTxCharacteristic->notify();
         }
-        lastPos = -1;
+      }
     }
+    atualizarDisplay();
+  }
+  lastClkState = currentClkState;
 
-    if (currentMenuPos != lastPos) {
-        menuValues[1] = (homingState == STATE_CALIBRATED) ? 1 : 0;
-        drawMenu(currentMenuPos);
-        lastPos = currentMenuPos;
+  int currentSwState = digitalRead(ENC_SW);
+  static int lastSwState = HIGH;
+  if (currentSwState != lastSwState && currentSwState == LOW) {
+    if (millis() - ultimoDebounce >= 250) {
+      ultimoDebounce = millis();
+      acordaTela();
+      if (faseAtual == FASE_MODO) { faseAtual = FASE_CAMPO; linhaSelecionada = 1; }
+      else if (faseAtual == FASE_CAMPO) { faseAtual = FASE_VALOR; }
+      else if (faseAtual == FASE_VALOR) {
+        exibirTelaSalvando(); salvarConfiguracao(); delay(500);
+        if (dispositivoConectado && autenticado) {
+          String msg = "MODO:" + String(sistemaEmModoDMX ? 0 : modoAtual) + "|DMX:" + String(enderecoDMX) + "\n";
+          pTxCharacteristic->setValue(msg.c_str()); pTxCharacteristic->notify();
+        }
+        faseAtual = FASE_MODO; linhaSelecionada = 0;
+      }
+      atualizarDisplay();
     }
+  }
+  lastSwState = currentSwState;
 }
 
-// --- Kinetic & Solenoid Functions ---
+uint32_t obterDeviceIDUnico() {
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  uint32_t deviceID = ((uint32_t)mac[2] << 24) |
+                      ((uint32_t)mac[3] << 16) |
+                      ((uint32_t)mac[4] << 8)  |
+                      (uint32_t)mac[5];
+  return deviceID;
+}
+
+String obterUIDString() {
+  uint32_t dev_id = obterDeviceIDUnico();
+  char buf[20];
+  sprintf(buf, "4D49:%08X", dev_id);
+  return String(buf);
+}
+
+void setRS485Direction(bool tx) {
+  pinMode(RS485_DIR_PIN, OUTPUT);
+  digitalWrite(RS485_DIR_PIN, tx ? HIGH : LOW);
+}
+
+void parseUID(String uidStr, uint8_t *man_id, uint8_t *dev_id) {
+  uidStr.replace(":", "");
+  uidStr.trim();
+  if (uidStr.length() < 12) return;
+
+  man_id[0] = strtol(uidStr.substring(0, 2).c_str(), NULL, 16);
+  man_id[1] = strtol(uidStr.substring(2, 4).c_str(), NULL, 16);
+
+  dev_id[0] = strtol(uidStr.substring(4, 6).c_str(), NULL, 16);
+  dev_id[1] = strtol(uidStr.substring(6, 8).c_str(), NULL, 16);
+  dev_id[2] = strtol(uidStr.substring(8, 10).c_str(), NULL, 16);
+  dev_id[3] = strtol(uidStr.substring(10, 12).c_str(), NULL, 16);
+}
+
+void enviarRdmSetDmxAddress(String uidStr, int novoCanal) {
+  uint8_t dest_man[2] = {0, 0};
+  uint8_t dest_dev[4] = {0, 0, 0, 0};
+  parseUID(uidStr, dest_man, dest_dev);
+
+  uint8_t rdm_packet[28];
+  rdm_packet[0] = 0xCC;
+  rdm_packet[1] = 0x01;
+  rdm_packet[2] = 26;
+
+  rdm_packet[3] = dest_man[0];
+  rdm_packet[4] = dest_man[1];
+  rdm_packet[5] = dest_dev[0];
+  rdm_packet[6] = dest_dev[1];
+  rdm_packet[7] = dest_dev[2];
+  rdm_packet[8] = dest_dev[3];
+
+  rdm_packet[9] = 0x4D;
+  rdm_packet[10] = 0x49;
+  rdm_packet[11] = 0x00;
+  rdm_packet[12] = 0x00;
+  rdm_packet[13] = 0x00;
+  rdm_packet[14] = 0x01;
+
+  static uint8_t transaction_num = 0;
+  rdm_packet[15] = transaction_num++;
+  rdm_packet[16] = 0x01;
+  rdm_packet[17] = 0x00;
+  rdm_packet[18] = 0x00;
+  rdm_packet[19] = 0x00;
+
+  rdm_packet[20] = 0x30;
+  rdm_packet[21] = 0x00;
+  rdm_packet[22] = 0xF0;
+  rdm_packet[23] = 0x02;
+
+  rdm_packet[24] = (novoCanal >> 8) & 0xFF;
+  rdm_packet[25] = novoCanal & 0xFF;
+
+  uint16_t checksum = 0;
+  for (int i = 0; i < 26; i++) {
+    checksum += rdm_packet[i];
+  }
+
+  rdm_packet[26] = (checksum >> 8) & 0xFF;
+  rdm_packet[27] = checksum & 0xFF;
+
+  setRS485Direction(true);
+
+  uart_set_line_inverse(DMX_UART_NUM, UART_SIGNAL_TXD_INV);
+  delayMicroseconds(180);
+
+  uart_set_line_inverse(DMX_UART_NUM, 0);
+  delayMicroseconds(20);
+
+  uart_write_bytes(DMX_UART_NUM, (const char*)rdm_packet, 28);
+
+  setRS485Direction(false);
+}
+
+void executarVarreduraRDM() {
+  if (!dispositivoConectado || !autenticado) return;
+
+  pTxCharacteristic->setValue("RDM_START\n");
+  pTxCharacteristic->notify();
+  delay(300);
+
+  uint32_t dev_id = obterDeviceIDUnico();
+  char buf[45];
+  sprintf(buf, "RDM_DEV:4d49,%08X,%d,7,MILETO_KINETIC_MOTOR\n", dev_id, enderecoDMX);
+  pTxCharacteristic->setValue(buf);
+  pTxCharacteristic->notify();
+  delay(300);
+
+  pTxCharacteristic->setValue("RDM_END\n");
+  pTxCharacteristic->notify();
+  delay(100);
+}
+
+void processarBluetooth() {
+  acordaTela();
+  comandoPendente.replace("\n", ""); comandoPendente.replace("\r", ""); comandoPendente.trim();
+  int div = comandoPendente.indexOf(':'); if (div == -1) return;
+  String cmd = comandoPendente.substring(0, div); String val = comandoPendente.substring(div + 1);
+  int iv = val.toInt();
+
+  if (cmd == "AUTH_RESPONSE") {
+    if (iv == (desafioHandshake * 2) + 7) {
+      autenticado = true;
+      pTxCharacteristic->setValue("MILETO_AUTH:VALID\nCONNECTED_OK\n"); pTxCharacteristic->notify();
+      delay(500);
+      executarVarreduraRDM();
+    } else {
+      autenticado = false;
+      pTxCharacteristic->setValue("MILETO_AUTH:INVALID\n"); pTxCharacteristic->notify();
+    }
+    return;
+  }
+  if (!autenticado) return;
+
+  // --- PARSE DOS COMANDOS EXCLUSIVOS DO MOTOR CINETICO ---
+  if (cmd == "SET_POS") {
+    targetPos = val.toInt();
+  }
+  else if (cmd == "SET_POINT_A") {
+    startLimit = currentPos;
+    salvarConfiguracao();
+  }
+  else if (cmd == "SET_POINT_B") {
+    endLimit = currentPos;
+    homingState = STATE_CALIBRATED;
+    salvarConfiguracao();
+  }
+  else if (cmd == "CALIBRAR") {
+    startHoming();
+  }
+  else if (cmd == "PARAR") {
+    targetPos = currentPos;
+    stopEffect();
+  }
+  else if (cmd == "SET_MODO") {
+    if (iv == 0) { sistemaEmModoDMX = true; }
+    else { sistemaEmModoDMX = false; modoAtual = iv; }
+  }
+  else if (cmd == "SET_VEL") { velocidad = min(iv, 100); maxSpeed = map(velocidad, 0, 100, 100, MAX_SPEED); }
+  else if (cmd == "SET_DMX") {
+    int commaIdx = val.indexOf(',');
+    if (commaIdx != -1) {
+      String uid = val.substring(0, commaIdx);
+      int canal = val.substring(commaIdx + 1).toInt();
+      enviarRdmSetDmxAddress(uid, canal);
+
+      String testUid = uid;
+      testUid.toUpperCase();
+      testUid.replace(":", "");
+
+      String localUid = obterUIDString();
+      localUid.toUpperCase();
+      localUid.replace(":", "");
+
+      if (testUid.indexOf(localUid) != -1) {
+        enderecoDMX = canal;
+        exibirTelaSalvando();
+        salvarConfiguracao();
+        delay(500);
+      }
+    } else {
+      enderecoDMX = iv;
+    }
+  }
+  else if (cmd == "VARREDURA_RDM") { executarVarreduraRDM(); }
+  else if (cmd == "CHAVE_MODO") { sistemaEmModoDMX = (val == "DMX"); if(!sistemaEmModoDMX && modoAtual == 0) modoAtual = 1; }
+  else if (cmd == "GRAVAR") { exibirTelaSalvando(); salvarConfiguracao(); pTxCharacteristic->setValue("GRAVAR:OK\n"); pTxCharacteristic->notify(); delay(1000); }
+  atualizarDisplay();
+}
+
 void lockSolenoid() {
     digitalWrite(SAFETY_LOCK_PIN, LOW);
     isLocked = true;
@@ -303,6 +524,44 @@ void startHoming() {
     homingState = STATE_HOMING_START;
     targetPos = -999999;
     maxSpeed = 800.0f;
+}
+
+void stopEffect() { isEffectRunning = false; }
+
+void startEffect(uint8_t effectId) {
+    isEffectRunning = true;
+    currentEffectId = effectId;
+    effectStartTime = millis();
+    sequenceStep = 0;
+}
+
+void updateEffects() {
+    if (!isEffectRunning) return;
+    unsigned long elapsed = millis() - effectStartTime;
+
+    switch (currentEffectId) {
+        case 1: // Loop Continuo A -> B -> A
+            if (currentPos == targetPos) {
+                if (sequenceStep == 0) { targetPos = endLimit; sequenceStep = 1; }
+                else { targetPos = startLimit; sequenceStep = 0; }
+            }
+            break;
+        case 2: // Oscilacao Senoidal Suave
+            {
+                float angle = (2.0f * PI * (float)(elapsed % 3000)) / 3000.0f;
+                float norm = (sinf(angle) + 1.0f) / 2.0f;
+                targetPos = startLimit + (long)(norm * (float)(endLimit - startLimit));
+            }
+            break;
+        case 3: // Onda em Cascata com Atraso de Fase de Grupo
+            {
+                float delayVal = (float)groupId * 0.5f;
+                float angle = (2.0f * PI * ((float)elapsed / 4000.0f)) + delayVal;
+                float norm = (sinf(angle) + 1.0f) / 2.0f;
+                targetPos = startLimit + (long)(norm * (float)(endLimit - startLimit));
+            }
+            break;
+    }
 }
 
 void updateStepper() {
@@ -372,231 +631,151 @@ void updateStepper() {
     }
 }
 
-// --- DMX & RDM Functions ---
-void updateDmx() {
-    if (Serial1.available()) {
-        static uint16_t idx = 0;
-        static bool inFrame = false;
-        static unsigned long lastByte = 0;
-        unsigned long now = micros();
+void processarDMX() {
+  uart_event_t evt;
+  while (xQueueReceive(dmx_queue, (void*)&evt, 0)) {
+    if (evt.type == UART_BREAK) { uart_flush_input(DMX_UART_NUM); dmx_idx = 0; dmx_em_frame = true; }
+    else if (evt.type == UART_DATA && dmx_em_frame) {
+      size_t l = 0; uart_get_buffered_data_len(DMX_UART_NUM, &l);
+      if (l > 0) {
+        uint8_t t[64]; int r = uart_read_bytes(DMX_UART_NUM, t, (l > 64) ? 64 : l, 0);
+        for (int i = 0; i < r; i++) {
+          if (dmx_em_frame) {
+            if (dmx_idx < 520) raw_dmx_buf[dmx_idx] = t[i]; dmx_idx++;
+            if (dmx_idx >= (enderecoDMX + DMX_CH_LENGTH)) {
+              if (raw_dmx_buf[0] == 0x00) {
+                int idx = enderecoDMX;
 
-        if (now - lastByte > 150) { idx = 0; inFrame = false; }
-        lastByte = now;
+                uint8_t mode = raw_dmx_buf[idx];
+                uint16_t rawPos = (raw_dmx_buf[idx + DMX_CH_POS_MSB - 1] << 8) | raw_dmx_buf[idx + DMX_CH_POS_LSB - 1];
+                uint8_t speedVal = raw_dmx_buf[idx + DMX_CH_SPEED - 1];
+                uint8_t lockCmd = raw_dmx_buf[idx + DMX_CH_LOCK_CMD - 1];
+                uint8_t netGroupId = raw_dmx_buf[idx + DMX_CH_GROUP_ID - 1];
+                uint8_t effectId = raw_dmx_buf[idx + DMX_CH_EFFECT_ID - 1];
 
-        while (Serial1.available()) {
-            uint8_t data = Serial1.read();
-            if (idx == 0) {
-                if (data == 0x00 || data == 0xCC) {
-                    inFrame = true;
-                    dmxBuffer[0] = data;
-                    idx = 1;
+                maxSpeed = map(speedVal, 0, 255, 100, MAX_SPEED);
+                groupId = netGroupId;
+
+                if (lockCmd >= 128) lockSolenoid();
+
+                switch (mode) {
+                  case 0: stopEffect(); targetPos = currentPos; break;
+                  case 1: {
+                    stopEffect();
+                    targetPos = map(rawPos, 0, 65535, startLimit, endLimit);
+                    break;
+                  }
+                  case 2: startEffect(effectId); break;
+                  case 3: stopEffect(); startHoming(); break;
                 }
-            } else if (inFrame) {
-                dmxBuffer[idx++] = data;
-                if (dmxBuffer[0] == 0x00 && idx >= 513) {
-                    newPacketReceived = true;
-                    idx = 0; inFrame = false;
-                } else if (dmxBuffer[0] == 0xCC && idx > 2) {
-                    uint8_t len = dmxBuffer[2];
-                    if (idx >= len) {
-                        handleRdmPacket(dmxBuffer, len);
-                        idx = 0; inFrame = false;
-                    }
-                }
+              }
+              dmx_em_frame = false;
             }
+          }
         }
+      }
     }
-
-    if (newPacketReceived) {
-        newPacketReceived = false;
-        uint8_t mode = dmxBuffer[dmxAddress];
-        uint8_t speedVal = dmxBuffer[dmxAddress + DMX_CH_SPEED - 1];
-        uint8_t lockCmd = dmxBuffer[dmxAddress + DMX_CH_LOCK_CMD - 1];
-        uint8_t netGroupId = dmxBuffer[dmxAddress + DMX_CH_GROUP_ID - 1];
-        uint8_t effectId = dmxBuffer[dmxAddress + DMX_CH_EFFECT_ID - 1];
-
-        maxSpeed = map(speedVal, 0, 255, 100, MAX_SPEED);
-        groupId = netGroupId;
-        menuValues[4] = groupId;
-
-        if (lockCmd >= 128) lockSolenoid();
-
-        switch (mode) {
-            case 0: stopEffect(); targetPos = currentPos; break;
-            case 1: {
-                stopEffect();
-                uint16_t rawPos = (dmxBuffer[dmxAddress + DMX_CH_POS_MSB - 1] << 8) | dmxBuffer[dmxAddress + DMX_CH_POS_LSB - 1];
-                targetPos = map(rawPos, 0, 65535, startLimit, endLimit);
-                break;
-            }
-            case 2: startEffect(effectId); break;
-            case 3: stopEffect(); startHoming(); break;
-        }
-    }
+  }
 }
 
-void handleRdmPacket(uint8_t* rdmData, uint16_t length) {
-    if (length < 24) return;
-    uint8_t dest[6];
-    for (int i = 0; i < 6; i++) dest[i] = rdmData[3 + i];
-    uint8_t cmdClass = rdmData[20];
-    uint16_t pid = (rdmData[21] << 8) | rdmData[22];
-
-    if (cmdClass == 0x10) {
-        if (pid == 0x0001 && length >= 36) {
-            uint8_t low[6], high[6];
-            for (int i = 0; i < 6; i++) { low[i] = rdmData[24 + i]; high[i] = rdmData[30 + i]; }
-            bool active = true;
-            for (int i = 0; i < 6; i++) {
-                if (uid[i] < low[i]) { active = false; break; }
-                else if (uid[i] > low[i]) break;
-            }
-            for (int i = 0; i < 6; i++) {
-                if (uid[i] > high[i]) { active = false; break; }
-                else if (uid[i] < high[i]) break;
-            }
-            if (active && !isRdmMuted) {
-                uint8_t response[24] = { 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xFE, 0xAA };
-                for(int i=0; i<6; i++) {
-                    response[9 + i*2] = uid[i] | 0xAA;
-                    response[10 + i*2] = uid[i] | 0x55;
-                }
-                sendRdmResponse(response, 21);
-            }
-        } else if (pid == 0x0002) {
-            bool isMe = true;
-            for (int i = 0; i < 6; i++) if (dest[i] != uid[i]) isMe = false;
-            if (isMe) { isRdmMuted = true; uint8_t resp[1] = {0}; sendRdmResponse(resp, 1); }
-        } else if (pid == 0x0003) {
-            bool isMe = true;
-            for (int i = 0; i < 6; i++) if (dest[i] != uid[i]) isMe = false;
-            if (isMe) { isRdmMuted = false; uint8_t resp[1] = {0}; sendRdmResponse(resp, 1); }
-        }
-    } else if (cmdClass == 0x20) {
-        bool isMe = true;
-        for (int i = 0; i < 6; i++) if (dest[i] != uid[i]) isMe = false;
-        if (isMe && pid == 0x00F0) {
-            uint8_t resp[2] = { (uint8_t)(dmxAddress >> 8), (uint8_t)(dmxAddress & 0xFF) };
-            sendRdmResponse(resp, 2);
-        }
-    } else if (cmdClass == 0x30) {
-        bool isMe = true;
-        for (int i = 0; i < 6; i++) if (dest[i] != uid[i]) isMe = false;
-        if (isMe && pid == 0x00F0) {
-            dmxAddress = (rdmData[24] << 8) | rdmData[25];
-            menuValues[0] = dmxAddress;
-            uint8_t resp[2] = { (uint8_t)(dmxAddress >> 8), (uint8_t)(dmxAddress & 0xFF) };
-            sendRdmResponse(resp, 2);
-        }
-    }
+void desenharLogo(const unsigned char* bitmap, int largura, int altura) {
+  display.clearDisplay();
+  display.drawBitmap(0, 0, bitmap, largura, altura, WHITE);
+  display.display();
 }
 
-void sendRdmResponse(uint8_t* response, uint16_t length) {
-    digitalWrite(DMX_DE_RE_PIN, HIGH);
-    delayMicroseconds(10);
-    Serial1.write(response, length);
-    Serial1.flush();
-    delayMicroseconds(10);
-    digitalWrite(DMX_DE_RE_PIN, LOW);
+void setup() {
+  Serial.begin(115200);
+  Serial.println("MILETO KINETIC STARTING...");
+  tempoUltimaAtividade = millis();
+
+  pinMode(RS485_DIR_PIN, OUTPUT);
+  digitalWrite(RS485_DIR_PIN, LOW);
+
+  pinMode(ENC_CLK, INPUT_PULLUP);
+  pinMode(ENC_DT, INPUT_PULLUP);
+  pinMode(ENC_SW, INPUT_PULLUP);
+  lastClkState = digitalRead(ENC_CLK);
+
+  pinMode(STEPPER_PUL_PIN, OUTPUT);
+  pinMode(STEPPER_DIR_PIN, OUTPUT);
+  pinMode(STEPPER_EN_PIN, OUTPUT);
+  digitalWrite(STEPPER_EN_PIN, LOW);
+
+  pinMode(SENSOR_START_PIN, INPUT_PULLUP);
+  pinMode(SENSOR_END_PIN, INPUT_PULLUP);
+  pinMode(SAFETY_LOCK_PIN, OUTPUT);
+  lockSolenoid();
+
+  Wire.begin(8, 9);
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { Serial.println("OLED ERR"); }
+  display.setTextColor(SSD1306_WHITE);
+  desenharLogo(MILETO_LOGO_1, LARGURA_TELA, ALTURA_TELA);
+  delay(3000);
+
+  carregarConfiguracao();
+  atualizarDisplay();
+
+  NimBLEDevice::init("MILETO");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  pServer = NimBLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  NimBLEService *pService = pServer->createService(SERVICE_UUID);
+  pTxCharacteristic = pService->createCharacteristic(TX_UUID, NIMBLE_PROPERTY::NOTIFY);
+  NimBLECharacteristic *pRxCharacteristic = pService->createCharacteristic(RX_UUID, NIMBLE_PROPERTY::WRITE);
+  pRxCharacteristic->setCallbacks(new CharacteristicCallbacks());
+  pService->start();
+
+  NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
+  NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
+  BLEAdvertisementData mainAdv;
+  mainAdv.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
+  mainAdv.setCompleteServices(BLEUUID(SERVICE_UUID));
+  mainAdv.setName("MILETO");
+  pAdvertising->setAdvertisementData(mainAdv);
+
+  BLEAdvertisementData scanResponseData;
+  scanResponseData.setName("MILETO");
+  pAdvertising->setScanResponseData(scanResponseData);
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->enableScanResponse(true);
+  pAdvertising->setMinInterval(32);
+  pAdvertising->setMaxInterval(64);
+  pAdvertising->start();
+
+  uart_config_t uart_cfg = { .baud_rate = 250000, .data_bits = UART_DATA_8_BITS, .parity = UART_PARITY_DISABLE, .stop_bits = UART_STOP_BITS_2, .flow_ctrl = UART_HW_FLOWCTRL_DISABLE, .source_clk = UART_SCLK_DEFAULT };
+  uart_param_config(DMX_UART_NUM, &uart_cfg);
+  uart_set_pin(DMX_UART_NUM, UART_PIN_NO_CHANGE, DMX_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+  uart_driver_install(DMX_UART_NUM, 1024, 0, 20, &dmx_queue, 0);
+
+  Serial.println("MILETO KINETIC READY!");
 }
 
-// --- BLE Functions ---
-void updateBle() {
-    if (bleConnected) {
-        static unsigned long notify = 0;
-        if (millis() - notify > 100) {
-            notify = millis();
-            uint8_t stats[10];
-            stats[0] = (homingState == STATE_CALIBRATED) ? 1 : 0;
-            stats[1] = (homingState == STATE_HOMING_START || homingState == STATE_HOMING_END) ? 1 : 0;
-            stats[2] = (currentPos >> 24) & 0xFF; stats[3] = (currentPos >> 16) & 0xFF;
-            stats[4] = (currentPos >> 8) & 0xFF; stats[5] = currentPos & 0xFF;
-            stats[6] = (targetPos >> 24) & 0xFF; stats[7] = (targetPos >> 16) & 0xFF;
-            stats[8] = (targetPos >> 8) & 0xFF; stats[9] = targetPos & 0xFF;
+void loop() {
+  if (novoComandoBle) { processarBluetooth(); novoComandoBle = false; comandoPendente = ""; }
+  static bool ultimoEstadoConexao = false;
+  static unsigned long lastAuthReq = 0;
+  if (dispositivoConectado != ultimoEstadoConexao) {
+    ultimoEstadoConexao = dispositivoConectado;
+    if (dispositivoConectado) { lastAuthReq = millis(); acordaTela(); }
+    atualizarDisplay();
+  }
+  if (dispositivoConectado && !autenticado && millis() - lastAuthReq >= 2000) {
+    lastAuthReq = millis();
+    String msg = "AUTH_CHALLENGE:"; msg += desafioHandshake; msg += "\n";
+    pTxCharacteristic->setValue(msg.c_str()); pTxCharacteristic->notify();
+  }
+  if (telaAcesa && (millis() - tempoUltimaAtividade >= TEMPO_SLEEP_TELA)) {
+    display.clearDisplay(); display.display();
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+    telaAcesa = false;
+  }
 
-            pStatusCharacteristic->setValue(stats, 10);
-            pStatusCharacteristic->notify();
-        }
-    }
-}
+  lidarComEncoder();
+  updateStepper();
+  updateEffects();
 
-// --- Effects Engine ---
-void startEffect(uint8_t effectId) {
-    isEffectRunning = true;
-    currentEffectId = effectId;
-    effectStartTime = millis();
-    sequenceStep = 0;
-}
-
-void stopEffect() { isEffectRunning = false; }
-
-void updateEffects() {
-    if (!isEffectRunning) return;
-    unsigned long elapsed = millis() - effectStartTime;
-
-    switch (currentEffectId) {
-        case 1: // Loop A -> B -> A
-            if (currentPos == targetPos) {
-                if (sequenceStep == 0) { targetPos = endLimit; sequenceStep = 1; }
-                else { targetPos = startLimit; sequenceStep = 0; }
-            }
-            break;
-        case 2: // Sine Wave Oscillation
-            {
-                float angle = (2.0f * PI * (float)(elapsed % 3000)) / 3000.0f;
-                float norm = (sinf(angle) + 1.0f) / 2.0f;
-                targetPos = startLimit + (long)(norm * (float)(endLimit - startLimit));
-            }
-            break;
-        case 3: // Group Phase Delayed Cascade Wave
-            {
-                float delay = (float)groupId * 0.5f;
-                float angle = (2.0f * PI * ((float)elapsed / 4000.0f)) + delay;
-                float norm = (sinf(angle) + 1.0f) / 2.0f;
-                targetPos = startLimit + (long)(norm * (float)(endLimit - startLimit));
-            }
-            break;
-    }
-}
-
-// --- UI Local Control ---
-void updateEncoder() {
-    int clk = digitalRead(ENCODER_CLK);
-    if (clk != encoderClkState && clk == LOW) {
-        if (digitalRead(ENCODER_DT) != clk) menuPosition++;
-        else menuPosition--;
-        if (menuPosition < 0) menuPosition = 0;
-    }
-    encoderClkState = clk;
-
-    if (digitalRead(ENCODER_SW) == LOW) {
-        if (millis() - lastDebounceTime > 250) {
-            encoderBtnPressed = true;
-            lastDebounceTime = millis();
-        }
-    }
-}
-
-void drawMenu(int currentSelection) {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setCursor(0, 0);
-    display.print("DMX:"); display.print(dmxAddress);
-    display.print(bleConnected ? " [BLE]" : " [WIFI]");
-    display.print((homingState == STATE_CALIBRATED) ? " CAL" : " UNCAL");
-    display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
-
-    int start = (currentSelection / 4) * 4;
-    for (int i = 0; i < 4; i++) {
-        int idx = start + i;
-        if (idx >= MENU_TOTAL) break;
-        display.setCursor(10, 15 + (i * 12));
-        if (idx == currentSelection) display.print("> ");
-        else display.print("  ");
-        display.print(menuOptions[idx]);
-        if (menuValues[idx] != -1) {
-            display.print(": "); display.print(menuValues[idx]);
-        }
-    }
-    display.display();
+  if (sistemaEmModoDMX) { processarDMX(); }
+  enviarStatusBT();
 }

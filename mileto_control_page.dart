@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 
@@ -10,25 +11,28 @@ class MiletoControlPage extends StatefulWidget {
 }
 
 class _MiletoControlPageState extends State<MiletoControlPage> {
-  static const String serviceUuid = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
-  static const String charCtrlUuid = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
-  static const String charStatusUuid = "c7e462d0-eb14-41d3-a9d0-0870932258aa";
+  static const String serviceUuid = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+  static const String txUuid = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+  static const String rxUuid = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 
   BluetoothDevice? targetDevice;
-  BluetoothCharacteristic? ctrlChar;
-  BluetoothCharacteristic? statusChar;
+  BluetoothCharacteristic? txChar;
+  BluetoothCharacteristic? rxChar;
 
   bool isScanning = false;
   bool isConnected = false;
+  bool isAuthenticated = false;
   List<BluetoothDevice> scanResults = [];
 
-  // Live status from device
+  // Live kinetic state telemetry
   bool isCalibrated = false;
   bool isHoming = false;
   int currentPosition = 0;
   int targetPosition = 0;
+  int startLimit = 0;
+  int endLimit = 10000;
 
-  StreamSubscription? statusSubscription;
+  StreamSubscription? rxSubscription;
 
   @override
   void initState() {
@@ -71,20 +75,14 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
     for (var service in services) {
       if (service.uuid.toString().toLowerCase() == serviceUuid) {
         for (var char in service.characteristics) {
-          if (char.uuid.toString().toLowerCase() == charCtrlUuid) {
-            ctrlChar = char;
-          } else if (char.uuid.toString().toLowerCase() == charStatusUuid) {
-            statusChar = char;
+          if (char.uuid.toString().toLowerCase() == rxUuid) {
+            rxChar = char;
+          } else if (char.uuid.toString().toLowerCase() == txUuid) {
+            txChar = char;
             await char.setNotifyValue(true);
-            statusSubscription = char.onValueReceived.listen((value) {
-              if (value.length >= 10 && mounted) {
-                setState(() {
-                  isCalibrated = value[0] == 1;
-                  isHoming = value[1] == 1;
-                  currentPosition = (value[2] << 24) | (value[3] << 16) | (value[4] << 8) | value[5];
-                  targetPosition = (value[6] << 24) | (value[7] << 16) | (value[8] << 8) | value[9];
-                });
-              }
+            rxSubscription = char.onValueReceived.listen((value) {
+              final text = utf8.decode(value);
+              handleIncomingBleMessage(text);
             });
           }
         }
@@ -92,31 +90,53 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
     }
   }
 
-  void sendCommand(List<int> bytes) async {
-    if (ctrlChar != null) {
-      await ctrlChar!.write(bytes, withoutResponse: false);
+  void handleIncomingBleMessage(String text) {
+    if (!mounted) return;
+
+    if (text.startsWith("AUTH_CHALLENGE:")) {
+      final challengeStr = text.split(":")[1].trim();
+      final challenge = int.tryParse(challengeStr);
+      if (challenge != null) {
+        // Handshake protocol response: (desafioHandshake * 2) + 7
+        final response = (challenge * 2) + 7;
+        sendRawCommand("AUTH_RESPONSE:$response");
+      }
+    } else if (text.startsWith("MILETO_AUTH:VALID")) {
+      setState(() {
+        isAuthenticated = true;
+      });
+    } else if (text.startsWith("STATS:")) {
+      final statsPayload = text.split(":")[1].trim();
+      final parts = statsPayload.split(",");
+      if (parts.length >= 6) {
+        setState(() {
+          isCalibrated = parts[0] == "1";
+          isHoming = parts[1] == "1";
+          currentPosition = int.tryParse(parts[2]) ?? 0;
+          targetPosition = int.tryParse(parts[3]) ?? 0;
+          startLimit = int.tryParse(parts[4]) ?? 0;
+          endLimit = int.tryParse(parts[5]) ?? 10000;
+        });
+      }
     }
   }
 
-  void setTargetPosition(int target) {
-    List<int> cmd = [
-      0x01,
-      (target >> 24) & 0xFF,
-      (target >> 16) & 0xFF,
-      (target >> 8) & 0xFF,
-      target & 0xFF,
-    ];
-    sendCommand(cmd);
+  void sendRawCommand(String cmd) async {
+    if (rxChar != null) {
+      await rxChar!.write(utf8.encode("$cmd\n"), withoutResponse: false);
+    }
   }
 
-  void setPointA() => sendCommand([0x02]);
-  void setPointB() => sendCommand([0x03]);
-  void triggerHoming() => sendCommand([0x04]);
-  void stopStepper() => sendCommand([0x05]);
+  void setTargetPosition(int target) => sendRawCommand("SET_POS:$target");
+  void setPointA() => sendRawCommand("SET_POINT_A:0");
+  void setPointB() => sendRawCommand("SET_POINT_B:0");
+  void triggerHoming() => sendRawCommand("CALIBRAR:0");
+  void stopStepper() => sendRawCommand("PARAR:0");
+  void saveConfig() => sendRawCommand("GRAVAR:0");
 
   @override
   void dispose() {
-    statusSubscription?.cancel();
+    rxSubscription?.cancel();
     targetDevice?.disconnect();
     super.dispose();
   }
@@ -125,8 +145,8 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Mileto DMX App Controller'),
-        backgroundColor: Colors.blueAccent,
+        title: const Text('Aplicativo Mileto Kinetic'),
+        backgroundColor: Colors.black,
       ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16.0),
@@ -137,7 +157,8 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
               ElevatedButton.icon(
                 onPressed: isScanning ? null : startScan,
                 icon: const Icon(Icons.search),
-                label: Text(isScanning ? 'Procurando...' : 'Procurar Dispositivo Mileto'),
+                label: Text(isScanning ? 'Escaneando...' : 'Buscar Dispositivo Mileto'),
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.amber[800]),
               ),
               const SizedBox(height: 10),
               ListView.builder(
@@ -147,47 +168,66 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
                 itemBuilder: (context, index) {
                   final dev = scanResults[index];
                   return ListTile(
-                    title: Text(dev.platformName.isNotEmpty ? dev.platformName : 'Dispositivo Desconhecido'),
+                    title: Text(dev.platformName.isNotEmpty ? dev.platformName : 'Dispositivo Mileto'),
                     subtitle: Text(dev.remoteId.toString()),
-                    trailing: const Icon(Icons.bluetooth),
+                    trailing: const Icon(Icons.bluetooth_connected, color: Colors.amber),
                     onTap: () => connectToDevice(dev),
                   );
                 },
               )
             ] else ...[
               Card(
-                elevation: 4,
+                color: Colors.grey[900],
+                elevation: 6,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                 child: Padding(
                   padding: const EdgeInsets.all(16.0),
                   child: Column(
                     children: [
                       Text(
-                        'Conectado ao Mileto DMX',
-                        style: Theme.of(context).textTheme.titleLarge?.copyWith(color: Colors.green),
+                        'Conexão Mileto Kinetic',
+                        style: Theme.of(context).textTheme.titleLarge?.copyWith(color: Colors.amber[700]),
                       ),
-                      const Divider(),
+                      const Divider(color: Colors.white24),
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          const Text('Calibrado:'),
+                          const Text('Autenticado:', style: TextStyle(color: Colors.white70)),
                           Icon(
-                            isCalibrated ? Icons.check_circle : Icons.error_outline,
-                            color: isCalibrated ? Colors.green : Colors.red,
+                            isAuthenticated ? Icons.lock_open : Icons.lock,
+                            color: isAuthenticated ? Colors.green : Colors.red,
                           )
                         ],
                       ),
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          const Text('Home status:'),
-                          Text(isHoming ? 'Buscando zero...' : 'Operação Normal')
+                          const Text('Status Calibração:', style: TextStyle(color: Colors.white70)),
+                          Text(
+                            isCalibrated ? 'Calibrado' : 'Sem Calibração',
+                            style: TextStyle(color: isCalibrated ? Colors.green : Colors.amber),
+                          )
                         ],
                       ),
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          const Text('Posição Atual:'),
-                          Text('$currentPosition passos')
+                          const Text('Ação Homing:', style: TextStyle(color: Colors.white70)),
+                          Text(isHoming ? 'Zerando motor...' : 'Normal', style: const TextStyle(color: Colors.white))
+                        ],
+                      ),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text('Posição Atual:', style: TextStyle(color: Colors.white70)),
+                          Text('$currentPosition passos', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold))
+                        ],
+                      ),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text('Limites gravados (A/B):', style: TextStyle(color: Colors.white70)),
+                          Text('$startLimit / $endLimit', style: const TextStyle(color: Colors.white))
                         ],
                       ),
                     ],
@@ -195,54 +235,70 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
                 ),
               ),
               const SizedBox(height: 20),
-              const Text('Controle Manual de Posição', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
-              Slider(
-                value: targetPosition.toDouble(),
-                min: 0,
-                max: 10000,
-                divisions: 100,
-                label: '$targetPosition',
-                onChanged: (val) {
-                  setState(() {
-                    targetPosition = val.toInt();
-                  });
-                  setTargetPosition(targetPosition);
-                },
-              ),
-              const SizedBox(height: 10),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                children: [
-                  ElevatedButton(
-                    onPressed: setPointA,
-                    style: ElevatedButton.styleFrom(backgroundColor: Colors.blue),
-                    child: const Text('Gravar Ponto A'),
+              if (isAuthenticated) ...[
+                const Text('Controle Manual do Motor Passo', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+                Slider(
+                  value: targetPosition.clamp(startLimit, endLimit).toDouble(),
+                  min: startLimit.toDouble(),
+                  max: endLimit.toDouble(),
+                  activeColor: Colors.amber[800],
+                  inactiveColor: Colors.grey,
+                  onChanged: (val) {
+                    setState(() {
+                      targetPosition = val.toInt();
+                    });
+                    setTargetPosition(targetPosition);
+                  },
+                ),
+                const SizedBox(height: 20),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    ElevatedButton(
+                      onPressed: setPointA,
+                      style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
+                      child: const Text('Gravar Início (A)'),
+                    ),
+                    ElevatedButton(
+                      onPressed: setPointB,
+                      style: ElevatedButton.styleFrom(backgroundColor: Colors.indigoAccent),
+                      child: const Text('Gravar Fim (B)'),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
+                    ElevatedButton.icon(
+                      onPressed: triggerHoming,
+                      icon: const Icon(Icons.refresh),
+                      label: const Text('Zerar Motor (Homing)'),
+                      style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+                    ),
+                    ElevatedButton.icon(
+                      onPressed: stopStepper,
+                      icon: const Icon(Icons.dangerous),
+                      label: const Text('PARAR'),
+                      style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 15),
+                ElevatedButton.icon(
+                  onPressed: saveConfig,
+                  icon: const Icon(Icons.save),
+                  label: const Text('Salvar na Memória NVS'),
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.amber[800]),
+                ),
+              ] else ...[
+                const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 20.0),
+                  child: Center(
+                    child: CircularProgressIndicator(color: Colors.amber),
                   ),
-                  ElevatedButton(
-                    onPressed: setPointB,
-                    style: ElevatedButton.styleFrom(backgroundColor: Colors.indigo),
-                    child: const Text('Gravar Ponto B'),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 10),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                children: [
-                  ElevatedButton.icon(
-                    onPressed: triggerHoming,
-                    icon: const Icon(Icons.settings_backup_restore),
-                    label: const Text('Calibrar Zero'),
-                    style: ElevatedButton.styleFrom(backgroundColor: Colors.amber[800]),
-                  ),
-                  ElevatedButton.icon(
-                    onPressed: stopStepper,
-                    icon: const Icon(Icons.stop),
-                    label: const Text('PARADA DE EMERGÊNCIA'),
-                    style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-                  ),
-                ],
-              ),
+                ),
+              ]
             ],
           ],
         ),
