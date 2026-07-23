@@ -36,8 +36,36 @@
 // TAU-S0837DL Safety Solenoid Lock (Active High via Transistor/Relay)
 #define SAFETY_LOCK_PIN   2
 
-// --- System Constants ---
-#define STEPS_PER_REV     1600   // Typical microstepping value (e.g., 1/8 on a 200 step/rev motor)
+// --- Kinematics & Mechanical Constants ---
+#define STEPS_PER_REV     1600   // Microstepping configured on NEMA 34 Driver
+
+// Physical diameters (in mm)
+#define MOTOR_SHAFT_DIA    15.0  // Motor shaft diameter
+#define PULLEY_UPPER_DIA   70.0  // Upper pulley diameter
+#define CABLE_DRUM_DIA     170.0 // Cable drum diameter (where cord wraps around)
+
+// Gear Reduction Ratio calculations:
+// Motor Shaft wraps to Upper Pulley (Ratio: 70 / 15)
+// Cable Drum is on the same shaft as Upper Pulley (Ratio: 1 / 1)
+#define KINEMATIC_RATIO    (PULLEY_UPPER_DIA / MOTOR_SHAFT_DIA)
+
+// Steps per millimeter of linear cable travel:
+// 1 motor revolution = PI * MOTOR_SHAFT_DIA * (PULLEY_UPPER_DIA / MOTOR_SHAFT_DIA) is not used.
+// Direct relationship: Motor drives the Upper Pulley, so one full Upper Pulley rotation needs:
+// STEPS_FOR_ONE_PULLEY_ROTATION = STEPS_PER_REV * (PULLEY_UPPER_DIA / MOTOR_SHAFT_DIA)
+// Since Upper Pulley shares the same shaft as the Cable Drum, one drum rotation is:
+// DRUM_CIRCUMFERENCE = PI * CABLE_DRUM_DIA
+// Hence: Steps per mm of Cable Travel = STEPS_FOR_ONE_PULLEY_ROTATION / (PI * CABLE_DRUM_DIA)
+#define PI_VAL             3.1415926535f
+#define STEPS_PER_MM       ((STEPS_PER_REV * KINEMATIC_RATIO) / (PI_VAL * CABLE_DRUM_DIA))
+
+// Target positioning limits (in mm)
+#define CALIBRATED_CABLE_TRAVEL_MM  1200.0 // 1.2 meters total vertical travel limit
+
+// Positioning disc has 50 teeth / slots for optical encoder
+#define SENSOR_DISC_TEETH  50
+#define STEPS_PER_TOOTH    ((STEPS_PER_REV * KINEMATIC_RATIO) / SENSOR_DISC_TEETH)
+
 #define MAX_SPEED         4000.0 // steps/sec
 #define MAX_ACCEL         8000.0 // steps/sec^2
 

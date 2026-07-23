@@ -37,7 +37,18 @@ Adafruit_SSD1306 display(LARGURA_TELA, ALTURA_TELA, &Wire, OLED_RESET);
 #define DMX_TX_PIN 21
 #define RS485_DIR_PIN 3  // Direcao do fluxo RS-485 para RDM
 
-// --- CONSTANTES ---
+// --- CONSTANTES CINÉTICAS MECÂNICAS ---
+#define STEPS_PER_REV     1600.0f
+#define MOTOR_SHAFT_DIA    15.0f
+#define PULLEY_UPPER_DIA   70.0f
+#define CABLE_DRUM_DIA     170.0f
+#define SENSOR_DISC_TEETH  50.0f
+
+#define KINEMATIC_RATIO    (PULLEY_UPPER_DIA / MOTOR_SHAFT_DIA)
+#define PI_VAL             3.1415926535f
+#define STEPS_PER_MM       ((STEPS_PER_REV * KINEMATIC_RATIO) / (PI_VAL * CABLE_DRUM_DIA))
+#define STEPS_PER_TOOTH    ((STEPS_PER_REV * KINEMATIC_RATIO) / SENSOR_DISC_TEETH)
+
 #define MAX_SPEED         4000.0
 #define MAX_ACCEL         8000.0
 
@@ -73,6 +84,10 @@ long endLimit = 10000;
 unsigned long lastStepTime = 0;
 unsigned long stepInterval = 0;
 bool stepState = false;
+
+// Optical disc tracking variables
+volatile long encoderTeethCount = 0;
+int lastSensorEndState = HIGH;
 
 // Trava Solenoide de Seguranca
 bool isLocked = true;
@@ -194,11 +209,15 @@ void enviarStatusBT() {
   static unsigned long last = 0;
   if (dispositivoConectado && autenticado && millis() - last >= 60) {
     last = millis();
-    char buf[80];
-    sprintf(buf, "STATS:%d,%d,%ld,%ld,%ld,%ld\n",
+    char buf[100];
+    // Conversão de passos do motor para milímetros de deslocamento real do cabo
+    float currentPosMM = (float)currentPos / STEPS_PER_MM;
+    float targetPosMM = (float)targetPos / STEPS_PER_MM;
+
+    sprintf(buf, "STATS:%d,%d,%ld,%ld,%ld,%ld,%.1f,%.1f\n",
             (homingState == STATE_CALIBRATED) ? 1 : 0,
             (homingState == STATE_HOMING_START || homingState == STATE_HOMING_END) ? 1 : 0,
-            currentPos, targetPos, startLimit, endLimit);
+            currentPos, targetPos, startLimit, endLimit, currentPosMM, targetPosMM);
     pTxCharacteristic->setValue(buf); pTxCharacteristic->notify();
   }
 }
@@ -232,12 +251,17 @@ void atualizarDisplay() {
     display.print("CANAL DMX: "); display.print(enderecoDMX);
     if (faseAtual == FASE_VALOR) display.print(" ]");
   } else {
-     display.setCursor(0, 34);
+     display.setCursor(0, 32);
      if (faseAtual == FASE_CAMPO && linhaSelecionada == 1) display.print("> "); else display.print("  ");
-     display.print("Pos: "); display.print(currentPos);
-     display.setCursor(0, 48);
+     float currentMM = (float)currentPos / STEPS_PER_MM;
+     display.print("Pos: "); display.print(currentMM, 1); display.print(" mm");
+
+     display.setCursor(0, 44);
      if (faseAtual == FASE_CAMPO && linhaSelecionada == 2) display.print("> "); else display.print("  ");
-     display.print("Lim: "); display.print(startLimit); display.print("/"); display.print(endLimit);
+     display.print("Teeth: "); display.print(encoderTeethCount);
+
+     display.setCursor(0, 54);
+     display.print("Lim: "); display.print((float)startLimit / STEPS_PER_MM, 0); display.print("/"); display.print((float)endLimit / STEPS_PER_MM, 0);
   }
   display.display();
 }
@@ -266,7 +290,6 @@ void lidarComEncoder() {
              if (subindo) { targetPos += 100; if (targetPos > endLimit) targetPos = endLimit; }
              else { targetPos -= 100; if (targetPos < startLimit) targetPos = startLimit; }
          } else if (linhaSelecionada == 2) {
-             // Manual Homing trigger
              startHoming();
          }
       }
@@ -524,6 +547,7 @@ void startHoming() {
     homingState = STATE_HOMING_START;
     targetPos = -999999;
     maxSpeed = 800.0f;
+    encoderTeethCount = 0;
 }
 
 void stopEffect() { isEffectRunning = false; }
@@ -565,6 +589,19 @@ void updateEffects() {
 }
 
 void updateStepper() {
+    // Read and count optical encoder wheel pulses (50 teeth per revolution)
+    int sensorEndState = digitalRead(SENSOR_END_PIN);
+    if (sensorEndState != lastSensorEndState) {
+        if (sensorEndState == LOW) { // Rising or falling transition depending on sensor logic
+            if (digitalRead(STEPPER_DIR_PIN) == HIGH) {
+                encoderTeethCount++;
+            } else {
+                encoderTeethCount--;
+            }
+        }
+        lastSensorEndState = sensorEndState;
+    }
+
     if (currentPos != targetPos) {
         if (isLocked) { unlockSolenoid(); return; }
         if (millis() - unlockTime < UNLOCK_DELAY_MS) return;
@@ -577,6 +614,7 @@ void updateStepper() {
     if (homingState == STATE_HOMING_START && digitalRead(SENSOR_START_PIN) == LOW) {
         currentPos = 0;
         startLimit = 0;
+        encoderTeethCount = 0;
         homingState = STATE_HOMING_END;
         targetPos = 999999;
         maxSpeed = 800.0f;
