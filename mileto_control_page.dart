@@ -24,13 +24,17 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
   bool isAuthenticated = false;
   List<BluetoothDevice> scanResults = [];
 
-  // Live kinetic state telemetry
+  // Telemetria do Motor Cinético com Encoder
   bool isCalibrated = false;
   bool isHoming = false;
   int currentPosition = 0;
   int targetPosition = 0;
   int startLimit = 0;
   int endLimit = 10000;
+  double currentPosMM = 0.0;
+  double targetPosMM = 0.0;
+  int motorEncoderSteps = 0;
+  int stepsDeviation = 0;
 
   StreamSubscription? rxSubscription;
 
@@ -97,7 +101,6 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
       final challengeStr = text.split(":")[1].trim();
       final challenge = int.tryParse(challengeStr);
       if (challenge != null) {
-        // Handshake protocol response: (desafioHandshake * 2) + 7
         final response = (challenge * 2) + 7;
         sendRawCommand("AUTH_RESPONSE:$response");
       }
@@ -108,7 +111,7 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
     } else if (text.startsWith("STATS:")) {
       final statsPayload = text.split(":")[1].trim();
       final parts = statsPayload.split(",");
-      if (parts.length >= 6) {
+      if (parts.length >= 10) {
         setState(() {
           isCalibrated = parts[0] == "1";
           isHoming = parts[1] == "1";
@@ -116,6 +119,10 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
           targetPosition = int.tryParse(parts[3]) ?? 0;
           startLimit = int.tryParse(parts[4]) ?? 0;
           endLimit = int.tryParse(parts[5]) ?? 10000;
+          currentPosMM = double.tryParse(parts[6]) ?? 0.0;
+          targetPosMM = double.tryParse(parts[7]) ?? 0.0;
+          motorEncoderSteps = int.tryParse(parts[8]) ?? 0;
+          stepsDeviation = int.tryParse(parts[9]) ?? 0;
         });
       }
     }
@@ -145,7 +152,7 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Aplicativo Mileto Kinetic'),
+        title: const Text('Aplicativo Mileto Kinetic Closed-Loop'),
         backgroundColor: Colors.black,
       ),
       body: SingleChildScrollView(
@@ -185,7 +192,7 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
                   child: Column(
                     children: [
                       Text(
-                        'Conexão Mileto Kinetic',
+                        'Conexão Mileto Malha Fechada',
                         style: Theme.of(context).textTheme.titleLarge?.copyWith(color: Colors.amber[700]),
                       ),
                       const Divider(color: Colors.white24),
@@ -216,11 +223,29 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
                           Text(isHoming ? 'Zerando motor...' : 'Normal', style: const TextStyle(color: Colors.white))
                         ],
                       ),
+                      const Divider(color: Colors.white10),
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          const Text('Posição Atual:', style: TextStyle(color: Colors.white70)),
-                          Text('$currentPosition passos', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold))
+                          const Text('Posição Real Cabo:', style: TextStyle(color: Colors.white70)),
+                          Text('${currentPosMM.toStringAsFixed(1)} mm', style: const TextStyle(color: Colors.green, fontWeight: FontWeight.bold))
+                        ],
+                      ),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text('Leitura Real Encoder:', style: TextStyle(color: Colors.white70)),
+                          Text('$motorEncoderSteps passos', style: const TextStyle(color: Colors.white))
+                        ],
+                      ),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text('Desvio de Passos (Erro):', style: TextStyle(color: Colors.white70)),
+                          Text(
+                            '$stepsDeviation passos',
+                            style: TextStyle(color: stepsDeviation > 10 ? Colors.red : Colors.green, fontWeight: FontWeight.bold),
+                          )
                         ],
                       ),
                       Row(

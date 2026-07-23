@@ -3,85 +3,71 @@
 
 #include <Arduino.h>
 
-// --- ESP32-C3 Pin Configuration ---
-// Note: ESP32-C3 has limited GPIOs (GPIO 0-10, 18-21). Let's allocate them carefully.
-// To avoid conflicts with Native USB CDC on GPIO 18/19, we avoid using 18 & 19 for active GPIOs.
+// --- Configuração de Pinos ESP32-C3 ---
+// Observação: O ESP32-C3 possui GPIOs limitadas (GPIO 0-10, 18-21). Vamos alocar com muito cuidado.
+// Evitamos GPIO 18/19 que são USB D-/D+ nativos para prevenir travamento no boot ou quebra do monitor serial.
 
-// OLED Display (I2C)
+// Display OLED (I2C)
 #define OLED_SDA          5
 #define OLED_SCL          6
-#define OLED_RESET       -1 // None
+#define OLED_RESET       -1 // Sem Reset físico
 #define SCREEN_WIDTH    128
 #define SCREEN_HEIGHT    64
 
-// Rotary Encoder with Switch
+// Encoder Rotativo Local do Menu
 #define ENCODER_CLK       0
 #define ENCODER_DT        1
-#define ENCODER_SW        2
+#define ENCODER_SW        10 // GPIO 10 usado para chave do encoder
 
 // DMX / RDM (UART1)
-#define DMX_RX_PIN        7
-#define DMX_TX_PIN        10
-#define DMX_DE_RE_PIN     3  // Transmit Enable (Active High) / Receive Enable (Active Low)
+#define DMX_RX_PIN        20
+#define DMX_TX_PIN        21
+#define DMX_DE_RE_PIN     3  // RS-485 Direção (HIGH = Transmitir, LOW = Receber)
 
-// Stepper Motor (NEMA 34 Microstep Driver)
+// Driver de Motor de Passo (NEMA 34)
 #define STEPPER_PUL_PIN   4
 #define STEPPER_DIR_PIN   9
 #define STEPPER_EN_PIN    20
 
-// Diffuse Photoelectric Positioning Sensors
+// Encoder de Feedback Acoplado ao Motor (Malha Fechada)
+// Usamos interrupções de hardware nas GPIOs 18 e 19 para leitura de quadratura ultra-rápida das fases A e B do encoder do motor.
+#define MOTOR_ENC_A       18
+#define MOTOR_ENC_B       19
+#define MOTOR_ENC_PPR     1000 // Resolução do encoder (Pulsos por Volta)
+
+// Sensores Fotoelétricos Difusos de Fim de Curso
 #define SENSOR_START_PIN  21
 #define SENSOR_END_PIN    1
 
-// TAU-S0837DL Safety Solenoid Lock (Active High via Transistor/Relay)
+// Trava de Segurança Solenoide TAU-S0837DL
 #define SAFETY_LOCK_PIN   2
 
-// --- Kinematics & Mechanical Constants ---
-#define STEPS_PER_REV     1600   // Microstepping configured on NEMA 34 Driver
+// --- Constantes Cinemáticas Mecânicas ---
+#define STEPS_PER_REV     1600.0f
+#define MOTOR_SHAFT_DIA    15.0f
+#define PULLEY_UPPER_DIA   70.0f
+#define CABLE_DRUM_DIA     170.0f
 
-// Physical diameters (in mm)
-#define MOTOR_SHAFT_DIA    15.0  // Motor shaft diameter
-#define PULLEY_UPPER_DIA   70.0  // Upper pulley diameter
-#define CABLE_DRUM_DIA     170.0 // Cable drum diameter (where cord wraps around)
-
-// Gear Reduction Ratio calculations:
-// Motor Shaft wraps to Upper Pulley (Ratio: 70 / 15)
-// Cable Drum is on the same shaft as Upper Pulley (Ratio: 1 / 1)
 #define KINEMATIC_RATIO    (PULLEY_UPPER_DIA / MOTOR_SHAFT_DIA)
-
-// Steps per millimeter of linear cable travel:
-// 1 motor revolution = PI * MOTOR_SHAFT_DIA * (PULLEY_UPPER_DIA / MOTOR_SHAFT_DIA) is not used.
-// Direct relationship: Motor drives the Upper Pulley, so one full Upper Pulley rotation needs:
-// STEPS_FOR_ONE_PULLEY_ROTATION = STEPS_PER_REV * (PULLEY_UPPER_DIA / MOTOR_SHAFT_DIA)
-// Since Upper Pulley shares the same shaft as the Cable Drum, one drum rotation is:
-// DRUM_CIRCUMFERENCE = PI * CABLE_DRUM_DIA
-// Hence: Steps per mm of Cable Travel = STEPS_FOR_ONE_PULLEY_ROTATION / (PI * CABLE_DRUM_DIA)
 #define PI_VAL             3.1415926535f
 #define STEPS_PER_MM       ((STEPS_PER_REV * KINEMATIC_RATIO) / (PI_VAL * CABLE_DRUM_DIA))
 
-// Target positioning limits (in mm)
-#define CALIBRATED_CABLE_TRAVEL_MM  1200.0 // 1.2 meters total vertical travel limit
+#define MAX_SPEED         4000.0 // passos/seg
+#define MAX_ACCEL         8000.0 // passos/seg^2
 
-// Positioning disc has 50 teeth / slots for optical encoder
-#define SENSOR_DISC_TEETH  50
-#define STEPS_PER_TOOTH    ((STEPS_PER_REV * KINEMATIC_RATIO) / SENSOR_DISC_TEETH)
+// Mapa de Canais DMX (Padrão Mileto)
+#define DMX_CH_MODE       1  // 0: Parado, 1: Ir para Posição, 2: Efeito, 3: Calibrar/Homing
+#define DMX_CH_POS_MSB    2
+#define DMX_CH_POS_LSB    3
+#define DMX_CH_SPEED      4
+#define DMX_CH_LOCK_CMD   5
+#define DMX_CH_GROUP_ID   6
+#define DMX_CH_EFFECT_ID  7
+#define DMX_CH_LENGTH     7
 
-#define MAX_SPEED         4000.0 // steps/sec
-#define MAX_ACCEL         8000.0 // steps/sec^2
-
-// DMX Channel Map (Standard Moving/Positioning Fixture)
-#define DMX_CH_MODE       1  // 0: Idle/Stop, 1: Goto Position, 2: Run Sequence, 3: Calibrate
-#define DMX_CH_POS_MSB    2  // Target position High Byte
-#define DMX_CH_POS_LSB    3  // Target position Low Byte
-#define DMX_CH_SPEED      4  // Target speed (0-255 map to 0-MAX_SPEED)
-#define DMX_CH_LOCK_CMD   5  // 0-127: Auto Lock, 128-255: Force Lock ON
-#define DMX_CH_GROUP_ID   6  // Sync groups (0-255)
-#define DMX_CH_EFFECT_ID  7  // Effect sequence selection
-#define DMX_CH_LENGTH     7  // 7-channel fixture
-
-// App Configuration
-#define BLE_SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define BLE_CHAR_CTRL_UUID         "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define BLE_CHAR_STATUS_UUID       "c7e462d0-eb14-41d3-a9d0-0870932258aa"
+// UUIDs Bluetooth Low Energy (BLE) App Mileto
+#define BLE_SERVICE_UUID           "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define BLE_CHAR_CTRL_UUID         "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+#define BLE_CHAR_STATUS_UUID       "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
 #endif // CONFIG_H

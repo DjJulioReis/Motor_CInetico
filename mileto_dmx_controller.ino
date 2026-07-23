@@ -32,22 +32,28 @@ Adafruit_SSD1306 display(LARGURA_TELA, ALTURA_TELA, &Wire, OLED_RESET);
 
 #define SAFETY_LOCK_PIN   2
 
+// Encoder Acoplado ao Motor (Quadraturas A/B de Hardware)
+#define MOTOR_ENC_A       18
+#define MOTOR_ENC_B       19
+#define MOTOR_ENC_PPR     1000.0f // Pulsos por Volta do Encoder
+
 #define DMX_UART_NUM UART_NUM_1
 #define DMX_RX_PIN 20
 #define DMX_TX_PIN 21
-#define RS485_DIR_PIN 3  // Direcao do fluxo RS-485 para RDM
+#define RS485_DIR_PIN 3  // Direção do fluxo RS-485 para RDM
 
 // --- CONSTANTES CINÉTICAS MECÂNICAS ---
 #define STEPS_PER_REV     1600.0f
 #define MOTOR_SHAFT_DIA    15.0f
 #define PULLEY_UPPER_DIA   70.0f
 #define CABLE_DRUM_DIA     170.0f
-#define SENSOR_DISC_TEETH  50.0f
 
 #define KINEMATIC_RATIO    (PULLEY_UPPER_DIA / MOTOR_SHAFT_DIA)
 #define PI_VAL             3.1415926535f
 #define STEPS_PER_MM       ((STEPS_PER_REV * KINEMATIC_RATIO) / (PI_VAL * CABLE_DRUM_DIA))
-#define STEPS_PER_TOOTH    ((STEPS_PER_REV * KINEMATIC_RATIO) / SENSOR_DISC_TEETH)
+
+// Fator de Conversão para Sincronizar Passos do Motor com os Pulsos do Encoder Real
+#define MOTOR_STEPS_PER_ENC_PULSE (STEPS_PER_REV / MOTOR_ENC_PPR)
 
 #define MAX_SPEED         4000.0
 #define MAX_ACCEL         8000.0
@@ -85,9 +91,10 @@ unsigned long lastStepTime = 0;
 unsigned long stepInterval = 0;
 bool stepState = false;
 
-// Optical disc tracking variables
-volatile long encoderTeethCount = 0;
-int lastSensorEndState = HIGH;
+// Variáveis Voláteis do Encoder de Hardware do Motor
+volatile long motorEncoderPulses = 0;
+long lastEncoderPosition = 0;
+long stepLossCorrectionCount = 0;
 
 // Trava Solenoide de Seguranca
 bool isLocked = true;
@@ -144,6 +151,17 @@ void startEffect(uint8_t effectId);
 void updateEffects();
 void updateStepper();
 void setRS485Direction(bool tx);
+
+// ISR Interrupção do Encoder do Motor (Fase A)
+void IRAM_ATTR motorEncoderISR() {
+    int stateA = digitalRead(MOTOR_ENC_A);
+    int stateB = digitalRead(MOTOR_ENC_B);
+    if (stateA == stateB) {
+        motorEncoderPulses++;
+    } else {
+        motorEncoderPulses--;
+    }
+}
 
 class ServerCallbacks: public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
@@ -209,15 +227,17 @@ void enviarStatusBT() {
   static unsigned long last = 0;
   if (dispositivoConectado && autenticado && millis() - last >= 60) {
     last = millis();
-    char buf[100];
-    // Conversão de passos do motor para milímetros de deslocamento real do cabo
+    char buf[120];
     float currentPosMM = (float)currentPos / STEPS_PER_MM;
     float targetPosMM = (float)targetPos / STEPS_PER_MM;
+    long realEncPosInSteps = motorEncoderPulses * MOTOR_STEPS_PER_ENC_PULSE;
+    long deviationInSteps = abs(currentPos - realEncPosInSteps);
 
-    sprintf(buf, "STATS:%d,%d,%ld,%ld,%ld,%ld,%.1f,%.1f\n",
+    sprintf(buf, "STATS:%d,%d,%ld,%ld,%ld,%ld,%.1f,%.1f,%ld,%ld\n",
             (homingState == STATE_CALIBRATED) ? 1 : 0,
             (homingState == STATE_HOMING_START || homingState == STATE_HOMING_END) ? 1 : 0,
-            currentPos, targetPos, startLimit, endLimit, currentPosMM, targetPosMM);
+            currentPos, targetPos, startLimit, endLimit, currentPosMM, targetPosMM,
+            realEncPosInSteps, deviationInSteps);
     pTxCharacteristic->setValue(buf); pTxCharacteristic->notify();
   }
 }
@@ -258,10 +278,11 @@ void atualizarDisplay() {
 
      display.setCursor(0, 44);
      if (faseAtual == FASE_CAMPO && linhaSelecionada == 2) display.print("> "); else display.print("  ");
-     display.print("Teeth: "); display.print(encoderTeethCount);
+     long realSteps = motorEncoderPulses * MOTOR_STEPS_PER_ENC_PULSE;
+     display.print("Enc: "); display.print(realSteps);
 
      display.setCursor(0, 54);
-     display.print("Lim: "); display.print((float)startLimit / STEPS_PER_MM, 0); display.print("/"); display.print((float)endLimit / STEPS_PER_MM, 0);
+     display.print("Erros: "); display.print(stepLossCorrectionCount);
   }
   display.display();
 }
@@ -547,7 +568,7 @@ void startHoming() {
     homingState = STATE_HOMING_START;
     targetPos = -999999;
     maxSpeed = 800.0f;
-    encoderTeethCount = 0;
+    motorEncoderPulses = 0;
 }
 
 void stopEffect() { isEffectRunning = false; }
@@ -589,23 +610,18 @@ void updateEffects() {
 }
 
 void updateStepper() {
-    // Read and count optical encoder wheel pulses (50 teeth per revolution)
-    int sensorEndState = digitalRead(SENSOR_END_PIN);
-    if (sensorEndState != lastSensorEndState) {
-        if (sensorEndState == LOW) { // Rising or falling transition depending on sensor logic
-            if (digitalRead(STEPPER_DIR_PIN) == HIGH) {
-                encoderTeethCount++;
-            } else {
-                encoderTeethCount--;
-            }
-        }
-        lastSensorEndState = sensorEndState;
-    }
-
     if (currentPos != targetPos) {
         if (isLocked) { unlockSolenoid(); return; }
         if (millis() - unlockTime < UNLOCK_DELAY_MS) return;
     } else {
+        // Rotina de Correção Ativa de Malha Fechada (Closed-Loop) ao parar
+        long targetInEncUnits = currentPos / MOTOR_STEPS_PER_ENC_PULSE;
+        long diff = targetInEncUnits - motorEncoderPulses;
+        if (abs(diff) > 2) { // Margem de erro de tolerância física
+            stepLossCorrectionCount++;
+            currentPos = motorEncoderPulses * MOTOR_STEPS_PER_ENC_PULSE; // Alinha passos lógicos com o encoder real
+        }
+
         lockOnIdle();
         currentSpeed = 0;
         return;
@@ -614,7 +630,7 @@ void updateStepper() {
     if (homingState == STATE_HOMING_START && digitalRead(SENSOR_START_PIN) == LOW) {
         currentPos = 0;
         startLimit = 0;
-        encoderTeethCount = 0;
+        motorEncoderPulses = 0;
         homingState = STATE_HOMING_END;
         targetPos = 999999;
         maxSpeed = 800.0f;
@@ -744,6 +760,11 @@ void setup() {
   pinMode(SENSOR_END_PIN, INPUT_PULLUP);
   pinMode(SAFETY_LOCK_PIN, OUTPUT);
   lockSolenoid();
+
+  // Inicializa Pinos do Encoder do Motor e Registra Interrupções
+  pinMode(MOTOR_ENC_A, INPUT_PULLUP);
+  pinMode(MOTOR_ENC_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(MOTOR_ENC_A), motorEncoderISR, CHANGE);
 
   Wire.begin(8, 9);
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { Serial.println("OLED ERR"); }
