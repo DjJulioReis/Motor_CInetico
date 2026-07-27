@@ -59,7 +59,8 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
 
   // Constantes de cálculo baseadas em cabo de 400mm útil máximo
   static const double maxAlturaCaboMM = 400.0;
-  static const double stepsPerMM = 40.0; // Exemplo: 16000 passos para 400mm de curso
+  static const double stepsPerMM =
+      40.0; // Exemplo: 16000 passos para 400mm de curso
 
   @override
   void initState() {
@@ -139,11 +140,12 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
   }
 
   void connectToDevice(BluetoothDevice device) async {
-    await device.connect();
+    await device.connect(license: License());
     setState(() {
       targetDevice = device;
       isConnected = true;
-      motoresConectados.clear(); // Limpa simulados ao conectar com hardware real
+      motoresConectados
+          .clear(); // Limpa simulados ao conectar com hardware real
     });
 
     List<BluetoothService> services = await device.discoverServices();
@@ -198,12 +200,14 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
         setState(() {
           bool existe = motoresConectados.any((m) => m.uid == fullUid);
           if (!existe) {
-            motoresConectados.add(MotorCinetico(
-              uid: fullUid,
-              nome: "$modelName [$fullUid]",
-              dmxAddress: addr,
-              isCalibrated: false,
-            ));
+            motoresConectados.add(
+              MotorCinetico(
+                uid: fullUid,
+                nome: "$modelName [$fullUid]",
+                dmxAddress: addr,
+                isCalibrated: false,
+              ),
+            );
           }
         });
       }
@@ -220,8 +224,14 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
           m.isHoming = parts[1] == "1";
           m.currentPosition = int.tryParse(parts[2]) ?? 0;
           m.targetPosition = int.tryParse(parts[3]) ?? 0;
-          m.currentPosMM = (double.tryParse(parts[6]) ?? 0.0).clamp(0.0, maxAlturaCaboMM);
-          m.targetPosMM = (double.tryParse(parts[7]) ?? 0.0).clamp(0.0, maxAlturaCaboMM);
+          m.currentPosMM = (double.tryParse(parts[6]) ?? 0.0).clamp(
+            0.0,
+            maxAlturaCaboMM,
+          );
+          m.targetPosMM = (double.tryParse(parts[7]) ?? 0.0).clamp(
+            0.0,
+            maxAlturaCaboMM,
+          );
           m.stepsDeviation = int.tryParse(parts[9]) ?? 0;
         });
       }
@@ -238,14 +248,23 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
   void setTargetPosition(MotorCinetico motor, int targetSteps) {
     setState(() {
       motor.targetPosition = targetSteps;
-      motor.targetPosMM = (targetSteps / stepsPerMM).clamp(0.0, maxAlturaCaboMM);
+      motor.targetPosMM = (targetSteps / stepsPerMM).clamp(
+        0.0,
+        maxAlturaCaboMM,
+      );
       // Simulação rápida de movimento suave offline para feedback visual do usuário
       if (!isConnected) {
         Timer.periodic(const Duration(milliseconds: 50), (timer) {
           if (motor.currentPosition < motor.targetPosition) {
-            motor.currentPosition = min(motor.currentPosition + 300, motor.targetPosition);
+            motor.currentPosition = min(
+              motor.currentPosition + 300,
+              motor.targetPosition,
+            );
           } else if (motor.currentPosition > motor.targetPosition) {
-            motor.currentPosition = max(motor.currentPosition - 300, motor.targetPosition);
+            motor.currentPosition = max(
+              motor.currentPosition - 300,
+              motor.targetPosition,
+            );
           }
           motor.currentPosMM = motor.currentPosition / stepsPerMM;
           if (mounted) setState(() {});
@@ -329,18 +348,25 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
                         children: [
                           Text(
                             motor.nome,
-                            style: const TextStyle(color: Colors.amber, fontSize: 20, fontWeight: FontWeight.bold),
+                            style: const TextStyle(
+                              color: Colors.amber,
+                              fontSize: 20,
+                              fontWeight: FontWeight.bold,
+                            ),
                           ),
                           Text(
                             "UID RDM: ${motor.uid} | Canal DMX: ${motor.dmxAddress}",
-                            style: const TextStyle(color: Colors.white54, fontSize: 12),
+                            style: const TextStyle(
+                              color: Colors.white54,
+                              fontSize: 12,
+                            ),
                           ),
                         ],
                       ),
                       IconButton(
                         onPressed: () => Navigator.pop(context),
                         icon: const Icon(Icons.close, color: Colors.white70),
-                      )
+                      ),
                     ],
                   ),
                   const Divider(color: Colors.white24, height: 20),
@@ -377,26 +403,56 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
                             mainAxisAlignment: MainAxisAlignment.center,
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              _buildTelemetryTile("Altura Real", "${motor.currentPosMM.toStringAsFixed(1)} mm", Colors.green),
+                              _buildTelemetryTile(
+                                "Altura Real",
+                                "${motor.currentPosMM.toStringAsFixed(1)} mm",
+                                Colors.green,
+                              ),
                               const SizedBox(height: 12),
-                              _buildTelemetryTile("Altura Alvo", "${motor.targetPosMM.toStringAsFixed(1)} mm", Colors.amber),
+                              _buildTelemetryTile(
+                                "Altura Alvo",
+                                "${motor.targetPosMM.toStringAsFixed(1)} mm",
+                                Colors.amber,
+                              ),
                               const SizedBox(height: 12),
-                              _buildTelemetryTile("Passos Motor", "${motor.currentPosition}", Colors.white),
+                              _buildTelemetryTile(
+                                "Passos Motor",
+                                "${motor.currentPosition}",
+                                Colors.white,
+                              ),
                               const SizedBox(height: 12),
-                              _buildTelemetryTile("Calibrado", motor.isCalibrated ? "SIM" : "NÃO", motor.isCalibrated ? Colors.green : Colors.red),
+                              _buildTelemetryTile(
+                                "Calibrado",
+                                motor.isCalibrated ? "SIM" : "NÃO",
+                                motor.isCalibrated ? Colors.green : Colors.red,
+                              ),
                               if (motor.isHoming) ...[
                                 const SizedBox(height: 12),
                                 const Row(
                                   children: [
-                                    SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.amber)),
+                                    SizedBox(
+                                      width: 16,
+                                      height: 16,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                        color: Colors.amber,
+                                      ),
+                                    ),
                                     SizedBox(width: 8),
-                                    Text("Buscando Zero...", style: TextStyle(color: Colors.amber, fontSize: 12, fontWeight: FontWeight.bold)),
+                                    Text(
+                                      "Buscando Zero...",
+                                      style: TextStyle(
+                                        color: Colors.amber,
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
                                   ],
-                                )
-                              ]
+                                ),
+                              ],
                             ],
                           ),
-                        )
+                        ),
                       ],
                     ),
                   ),
@@ -405,7 +461,11 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
                   // Slider de Altura do Cabo (0 a 400mm)
                   const Text(
                     "Programar Altura do Cabo (0 a 400mm)",
-                    style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold, fontSize: 14),
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 14,
+                    ),
                   ),
                   Slider(
                     value: motor.targetPosMM,
@@ -438,31 +498,39 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
                           setState(() {});
                           setTargetPosition(motor, 0);
                         },
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.blueGrey[800]),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.blueGrey[800],
+                        ),
                         child: const Text("Zerar Cabo"),
                       ),
                       ElevatedButton(
                         onPressed: () {
                           setModalState(() {
                             motor.targetPosMM = maxAlturaCaboMM / 2;
-                            motor.targetPosition = (motor.targetPosMM * stepsPerMM).toInt();
+                            motor.targetPosition =
+                                (motor.targetPosMM * stepsPerMM).toInt();
                           });
                           setState(() {});
                           setTargetPosition(motor, motor.targetPosition);
                         },
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.blueGrey[800]),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.blueGrey[800],
+                        ),
                         child: const Text("Metade (200mm)"),
                       ),
                       ElevatedButton(
                         onPressed: () {
                           setModalState(() {
                             motor.targetPosMM = maxAlturaCaboMM;
-                            motor.targetPosition = (maxAlturaCaboMM * stepsPerMM).toInt();
+                            motor.targetPosition =
+                                (maxAlturaCaboMM * stepsPerMM).toInt();
                           });
                           setState(() {});
                           setTargetPosition(motor, motor.targetPosition);
                         },
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.blueGrey[800]),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.blueGrey[800],
+                        ),
                         child: const Text("Curso Máx (400mm)"),
                       ),
                     ],
@@ -480,7 +548,9 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
                         },
                         icon: const Icon(Icons.refresh, size: 16),
                         label: const Text("Zerar Motor"),
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.green[700]),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.green[700],
+                        ),
                       ),
                       ElevatedButton.icon(
                         onPressed: () {
@@ -489,7 +559,9 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
                         },
                         icon: const Icon(Icons.stop, size: 16),
                         label: const Text("PARADA DE EMERGÊNCIA"),
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.red[800]),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.red[800],
+                        ),
                       ),
                     ],
                   ),
@@ -506,8 +578,18 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(label, style: const TextStyle(color: Colors.white38, fontSize: 11)),
-        Text(value, style: TextStyle(color: valColor, fontSize: 18, fontWeight: FontWeight.bold)),
+        Text(
+          label,
+          style: const TextStyle(color: Colors.white38, fontSize: 11),
+        ),
+        Text(
+          value,
+          style: TextStyle(
+            color: valColor,
+            fontSize: 18,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
       ],
     );
   }
@@ -525,7 +607,7 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
               icon: const Icon(Icons.save, color: Colors.amber),
               tooltip: "Gravar Todas as Configurações na NVS",
               onPressed: saveConfig,
-            )
+            ),
         ],
       ),
       body: Column(
@@ -535,13 +617,20 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
           Padding(
             padding: const EdgeInsets.all(12.0),
             child: Card(
-              color: isConnected ? const Color(0xFF1B2D1B) : const Color(0xFF2D1B1B),
+              color: isConnected
+                  ? const Color(0xFF1B2D1B)
+                  : const Color(0xFF2D1B1B),
               child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 12.0),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16.0,
+                  vertical: 12.0,
+                ),
                 child: Row(
                   children: [
                     Icon(
-                      isConnected ? Icons.bluetooth_connected : Icons.bluetooth_disabled,
+                      isConnected
+                          ? Icons.bluetooth_connected
+                          : Icons.bluetooth_disabled,
                       color: isConnected ? Colors.green : Colors.red,
                       size: 28,
                     ),
@@ -551,14 +640,26 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            isConnected ? "Controlador Mileto Pareado" : "Controlador Offline (Simulador Ativo)",
-                            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                            isConnected
+                                ? "Controlador Mileto Pareado"
+                                : "Controlador Offline (Simulador Ativo)",
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                            ),
                           ),
                           Text(
                             isConnected
-                                ? (isAuthenticated ? "Autenticado & Seguro" : "Aguardando Autenticação...")
+                                ? (isAuthenticated
+                                      ? "Autenticado & Seguro"
+                                      : "Aguardando Autenticação...")
                                 : "Modo de Teste Manual Individual Habilitado",
-                            style: TextStyle(color: isConnected ? Colors.white70 : Colors.amber, fontSize: 12),
+                            style: TextStyle(
+                              color: isConnected
+                                  ? Colors.white70
+                                  : Colors.amber,
+                              fontSize: 12,
+                            ),
                           ),
                         ],
                       ),
@@ -566,9 +667,11 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
                     if (!isConnected)
                       ElevatedButton(
                         onPressed: isScanning ? null : startScan,
-                        style: ElevatedButton.styleFrom(backgroundColor: Colors.amber[800]),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.amber[800],
+                        ),
                         child: Text(isScanning ? 'Buscando...' : 'Conectar'),
-                      )
+                      ),
                   ],
                 ),
               ),
@@ -590,21 +693,32 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
                     child: InkWell(
                       onTap: () => connectToDevice(dev),
                       child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16.0,
+                          vertical: 8.0,
+                        ),
                         width: 160,
                         child: Column(
                           mainAxisAlignment: MainAxisAlignment.center,
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Text(
-                              dev.platformName.isNotEmpty ? dev.platformName : "Mileto DMX",
+                              dev.platformName.isNotEmpty
+                                  ? dev.platformName
+                                  : "Mileto DMX",
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                              ),
                             ),
                             Text(
                               dev.remoteId.toString(),
-                              style: const TextStyle(color: Colors.white38, fontSize: 10),
+                              style: const TextStyle(
+                                color: Colors.white38,
+                                fontSize: 10,
+                              ),
                             ),
                           ],
                         ),
@@ -619,7 +733,11 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
             padding: EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
             child: Text(
               "Motores Cinéticos Conectados (Clique para programar)",
-              style: TextStyle(color: Colors.white70, fontSize: 14, fontWeight: FontWeight.bold),
+              style: TextStyle(
+                color: Colors.white70,
+                fontSize: 14,
+                fontWeight: FontWeight.bold,
+              ),
             ),
           ),
 
@@ -632,52 +750,89 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
                 final motor = motoresConectados[index];
                 return Card(
                   color: const Color(0xFF1E1E1E),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
                   child: ListTile(
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 16.0,
+                      vertical: 8.0,
+                    ),
                     leading: Container(
                       padding: const EdgeInsets.all(8),
                       decoration: BoxDecoration(
                         color: Colors.black,
                         borderRadius: BorderRadius.circular(8),
                       ),
-                      child: const Icon(Icons.settings_input_composite, color: Colors.amber),
+                      child: const Icon(
+                        Icons.settings_input_composite,
+                        color: Colors.amber,
+                      ),
                     ),
                     title: Text(
                       motor.nome,
-                      style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
+                      ),
                     ),
                     subtitle: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text("DMX: ${motor.dmxAddress} | UID: ${motor.uid}", style: const TextStyle(color: Colors.white38, fontSize: 11)),
+                        Text(
+                          "DMX: ${motor.dmxAddress} | UID: ${motor.uid}",
+                          style: const TextStyle(
+                            color: Colors.white38,
+                            fontSize: 11,
+                          ),
+                        ),
                         const SizedBox(height: 4),
                         Row(
                           children: [
                             Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 6,
+                                vertical: 2,
+                              ),
                               decoration: BoxDecoration(
-                                color: motor.isCalibrated ? Colors.green[800] : Colors.red[800],
+                                color: motor.isCalibrated
+                                    ? Colors.green[800]
+                                    : Colors.red[800],
                                 borderRadius: BorderRadius.circular(4),
                               ),
                               child: Text(
-                                motor.isCalibrated ? "Calibrado" : "Não Calibrado",
-                                style: const TextStyle(color: Colors.white, fontSize: 9),
+                                motor.isCalibrated
+                                    ? "Calibrado"
+                                    : "Não Calibrado",
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 9,
+                                ),
                               ),
                             ),
                             const SizedBox(width: 8),
-                            Text("Posição: ${motor.currentPosMM.toStringAsFixed(1)} mm", style: const TextStyle(color: Colors.amber, fontSize: 11)),
+                            Text(
+                              "Posição: ${motor.currentPosMM.toStringAsFixed(1)} mm",
+                              style: const TextStyle(
+                                color: Colors.amber,
+                                fontSize: 11,
+                              ),
+                            ),
                           ],
-                        )
+                        ),
                       ],
                     ),
-                    trailing: const Icon(Icons.arrow_forward_ios, color: Colors.white54, size: 16),
+                    trailing: const Icon(
+                      Icons.arrow_forward_ios,
+                      color: Colors.white54,
+                      size: 16,
+                    ),
                     onTap: () => abrirProgramacaoIndividual(motor),
                   ),
                 );
               },
             ),
-          )
+          ),
         ],
       ),
     );
@@ -721,7 +876,11 @@ class WinchKineticPainter extends CustomPainter {
       ..strokeWidth = 3;
     for (int i = 0; i < 5; i++) {
       double y = 20.0 + (i * 9);
-      canvas.drawLine(Offset(center - 30, y), Offset(center + 30, y), linePaint);
+      canvas.drawLine(
+        Offset(center - 30, y),
+        Offset(center + 30, y),
+        linePaint,
+      );
     }
 
     // 2. Desenha o Carretel / Tambor de Enrolamento (Diâmetro de 170mm na proporção)
@@ -736,7 +895,11 @@ class WinchKineticPainter extends CustomPainter {
     // Eixo e carretel acoplados
     canvas.drawCircle(Offset(center, 90), 30, drumPaint);
     canvas.drawCircle(Offset(center, 90), 24, drumInnerPaint);
-    canvas.drawCircle(Offset(center, 90), 10, motorPaint); // Eixo de 15mm central
+    canvas.drawCircle(
+      Offset(center, 90),
+      10,
+      motorPaint,
+    ); // Eixo de 15mm central
 
     // 3. Desenho e Cálculo do Cabo de Aço de 400mm
     final cablePaint = Paint()
@@ -775,7 +938,11 @@ class WinchKineticPainter extends CustomPainter {
     final sphereTargetPaint = Paint()
       ..color = Colors.amber.withOpacity(0.2)
       ..style = PaintingStyle.fill;
-    canvas.drawCircle(Offset(pontoInicioCaboX, pontoFimCaboY_Alvo), 10, sphereTargetPaint);
+    canvas.drawCircle(
+      Offset(pontoInicioCaboX, pontoFimCaboY_Alvo),
+      10,
+      sphereTargetPaint,
+    );
 
     // Desenha a linha sólida do cabo de aço na posição atual em movimento
     canvas.drawLine(
@@ -793,8 +960,16 @@ class WinchKineticPainter extends CustomPainter {
       ..color = Colors.white38
       ..style = PaintingStyle.fill;
 
-    canvas.drawCircle(Offset(pontoInicioCaboX, pontoFimCaboY_Atual), 11, spherePaint);
-    canvas.drawCircle(Offset(pontoInicioCaboX - 3, pontoFimCaboY_Atual - 3), 4, sphereHighlight);
+    canvas.drawCircle(
+      Offset(pontoInicioCaboX, pontoFimCaboY_Atual),
+      11,
+      spherePaint,
+    );
+    canvas.drawCircle(
+      Offset(pontoInicioCaboX - 3, pontoFimCaboY_Atual - 3),
+      4,
+      sphereHighlight,
+    );
 
     // 4. Desenha a Régua de Escala Cênica Lateral de 0 a 400mm
     final textPaint = Paint()
@@ -808,7 +983,11 @@ class WinchKineticPainter extends CustomPainter {
       double valorMM = pct * maxMM;
 
       // Desenha as marcas da escala
-      canvas.drawLine(Offset(pontoInicioCaboX - 60, y), Offset(pontoInicioCaboX - 45, y), textPaint);
+      canvas.drawLine(
+        Offset(pontoInicioCaboX - 60, y),
+        Offset(pontoInicioCaboX - 45, y),
+        textPaint,
+      );
 
       // Renderiza as marcações de texto em mm de forma limpa
       final textSpan = TextSpan(
