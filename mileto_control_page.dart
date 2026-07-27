@@ -494,8 +494,8 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
                     ],
                   ),
                 ],
-              );
-            });
+              ),
+            );
           },
         );
       },
