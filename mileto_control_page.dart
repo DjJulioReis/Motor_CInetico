@@ -140,7 +140,7 @@ class _MiletoControlPageState extends State<MiletoControlPage> {
   }
 
   void connectToDevice(BluetoothDevice device) async {
-    await device.connect(license: License());
+    await device.connect(license: License.values.first);
     setState(() {
       targetDevice = device;
       isConnected = true;
